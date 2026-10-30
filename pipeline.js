@@ -81,19 +81,95 @@ export function resizeBilinear(src, sw, sh, dw, dh) {
   return out;
 }
 
+// ---------- Metric scale from reference objects ----------
+// Normalisation shared by the fit and by buildPLY: dn = (disparity - lo) / span (2nd..98th percentile).
+export function normParams(disp) {
+  const s = Float32Array.from(disp).sort();
+  const lo = s[Math.floor(s.length * 0.02)], hi = s[Math.floor(s.length * 0.98)];
+  return { lo, span: Math.max(hi - lo, 1e-6) };
+}
+
+export function patchMedian(a, w, h, x, y, r = 2) {
+  const cx = Math.round(x), cy = Math.round(y), v = [];
+  for (let j = -r; j <= r; j++) for (let i = -r; i <= r; i++) {
+    const xx = cx + i, yy = cy + j;
+    if (xx >= 0 && yy >= 0 && xx < w && yy < h) v.push(a[yy * w + xx]);
+  }
+  v.sort((p, q) => p - q);
+  return v[v.length >> 1];
+}
+
+// refs: [{p1:{x,y}, p2:{x,y}, lengthM}] with pixel coordinates in the full-resolution captured frame (W x H).
+// disp: relative disparity at working resolution (w x h). Solves 1/Z = a*dn + b (Z in metres) so that every
+// reference's 3D end-to-end distance equals its known length (Levenberg-Marquardt on relative errors).
+export function fitMetric(refs, disp, w, h, W, H) {
+  if (refs.length < 2) return { ok: false, reason: "add at least two references" };
+  const { lo, span } = normParams(disp), K = intrinsics(W, H);
+  const items = refs.map((r) => ({
+    L: r.lengthM,
+    pix: Math.hypot(r.p2.x - r.p1.x, r.p2.y - r.p1.y),
+    e: [r.p1, r.p2].map((p) => ({
+      x: (p.x - K.cx) / K.fx, y: -(p.y - K.cy) / K.fy,
+      d: (patchMedian(disp, w, h, (p.x * w) / W, (p.y * h) / H) - lo) / span,
+    })),
+  }));
+  if (items.some((it) => it.pix < 8)) return { ok: false, reason: "a reference is too short in pixels - pin its two ends further apart" };
+
+  // initial guess: sideways approximation Z = L*f/pixels, then straight-line fit of 1/Z against d
+  const xs = items.map((it) => (it.e[0].d + it.e[1].d) / 2), ys = items.map((it) => it.pix / (it.L * K.fx));
+  const n = xs.length, mx = xs.reduce((s, v) => s + v, 0) / n, my = ys.reduce((s, v) => s + v, 0) / n;
+  let sxx = 0, sxy = 0;
+  xs.forEach((x, i) => { sxx += (x - mx) ** 2; sxy += (x - mx) * (ys[i] - my); });
+  if (sxx < 1e-6) return { ok: false, reason: "the references are at the same depth - place one nearer and one farther" };
+  let a = sxy / sxx, b = my - a * mx;
+
+  const res = (A, B) => items.map((it) => {
+    const P = it.e.map((q) => { const Z = 1 / Math.max(A * q.d + B, 1e-3); return [q.x * Z, q.y * Z, -Z]; });
+    return (Math.hypot(P[0][0] - P[1][0], P[0][1] - P[1][1], P[0][2] - P[1][2]) - it.L) / it.L;
+  });
+  let r = res(a, b), cost = r.reduce((s, v) => s + v * v, 0), lam = 1e-3;
+  for (let it = 0; it < 60; it++) {
+    const ea = 1e-4 * (Math.abs(a) + 1e-2), eb = 1e-4 * (Math.abs(b) + 1e-2);
+    const ra = res(a + ea, b), rb = res(a, b + eb);
+    let A00 = 0, A01 = 0, A11 = 0, g0 = 0, g1 = 0;
+    r.forEach((ri, i) => {
+      const j0 = (ra[i] - ri) / ea, j1 = (rb[i] - ri) / eb;
+      A00 += j0 * j0; A01 += j0 * j1; A11 += j1 * j1; g0 += j0 * ri; g1 += j1 * ri;
+    });
+    let improved = false;
+    for (let k = 0; k < 8; k++) {
+      const m00 = A00 * (1 + lam) + 1e-12, m11 = A11 * (1 + lam) + 1e-12, det = m00 * m11 - A01 * A01;
+      if (Math.abs(det) < 1e-18) { lam *= 10; continue; }
+      const da = -(m11 * g0 - A01 * g1) / det, db = -(-A01 * g0 + m00 * g1) / det;
+      const rn = res(a + da, b + db), cn = rn.reduce((s, v) => s + v * v, 0);
+      if (cn < cost) { a += da; b += db; r = rn; cost = cn; lam = Math.max(lam / 3, 1e-9); improved = true; break; }
+      lam *= 10;
+    }
+    if (!improved || cost < 1e-14) break;
+  }
+  if (items.some((it) => it.e.some((q) => a * q.d + b <= 1e-3)))
+    return { ok: false, reason: "inconsistent depth ordering - check the pinned points and lengths" };
+  const dm = items.map((it) => (it.e[0].d + it.e[1].d) / 2);
+  const spread = Math.max(...dm) - Math.min(...dm);
+  const notes = [];
+  if (spread < 0.08) notes.push("references are at similar depths, so the result is unreliable");
+  if (items.length === 2) notes.push("two references fit exactly, add a third to check the error");
+  return { ok: true, a, b, errorsPct: r.map((v) => v * 100), warning: notes.join("; ") };
+}
+
 // ---------- Step 4: point cloud -> binary PLY with 3D Gaussian Splatting properties ----------
-export function buildPLY(img, disp) {
+// metric = {a, b} from fitMetric(): points are in metres. Without it, depth is relative (arbitrary units).
+export function buildPLY(img, disp, metric = null) {
   const { width: w, height: h, data: px } = img, K = intrinsics(w, h);
-  const sorted = Float32Array.from(disp).sort();
-  const lo = sorted[Math.floor(sorted.length * 0.02)], hi = sorted[Math.floor(sorted.length * 0.98)];
-  const span = Math.max(hi - lo, 1e-6);
+  const { lo, span } = normParams(disp);
   const nx = Math.ceil(w / STRIDE), ny = Math.ceil(h / STRIDE), n = nx * ny, P = 17;
   const d = new Float32Array(n * P);
   let i = 0;
   for (let v = 0; v < h; v += STRIDE) {
     for (let u = 0; u < w; u += STRIDE) {
-      const dn = Math.min(Math.max((disp[v * w + u] - lo) / span, 0), 1);
-      const z = 1 / (1 / FAR + dn * (1 / NEAR - 1 / FAR));          // disparity ~ inverse depth
+      const dnu = (disp[v * w + u] - lo) / span;
+      const z = metric ? 1 / Math.max(metric.a * dnu + metric.b, 1 / 500)                            // metres
+        : 1 / (1 / FAR + Math.min(Math.max(dnu, 0), 1) * (1 / NEAR - 1 / FAR));                      // relative
       const o = i++ * P, p = (v * w + u) * 4;
       d[o] = ((u - K.cx) / K.fx) * z;                                 // x
       d[o + 1] = (-(v - K.cy) / K.fy) * z;                            // y (up)
@@ -113,8 +189,8 @@ export function buildPLY(img, disp) {
   return out.buffer;
 }
 
-// ---------- Full pipeline from a <video>/<canvas> frame ----------
-export async function reconstruct(source, sw, sh, onStatus = () => {}) {
+// ---------- Capture -> relative depth (kept in memory so the scale can be re-fitted later) ----------
+export async function estimateDepth(source, sw, sh, onStatus = () => {}) {
   const s = Math.min(1, MAX_SIDE / Math.max(sw, sh)), w = Math.round(sw * s), h = Math.round(sh * s);
   const c = document.createElement("canvas"); c.width = w; c.height = h;
   const ctx = c.getContext("2d", { willReadFrequently: true });
@@ -131,8 +207,12 @@ export async function reconstruct(source, sw, sh, onStatus = () => {}) {
   let out;
   try { out = await estimator(url); } finally { URL.revokeObjectURL(url); }
   const t = out.predicted_depth, [dh, dw] = t.dims.slice(-2);
-  const disp = resizeBilinear(t.data, dw, dh, w, h);
+  return { img, disp: resizeBilinear(t.data, dw, dh, w, h), w, h, W: sw, H: sh };
+}
 
+// Convenience: relative-depth PLY in one call (same as before).
+export async function reconstruct(source, sw, sh, onStatus = () => {}) {
+  const s = await estimateDepth(source, sw, sh, onStatus);
   onStatus("Building point cloud (.ply)…");
-  return buildPLY(img, disp);
+  return buildPLY(s.img, s.disp);
 }

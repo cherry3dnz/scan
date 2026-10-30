@@ -5,3 +5,5 @@ WebGPU or WASM) -> 3DGS-layout binary .ply -> WebGL2 Gaussian splat renderer tha
 
 Local test:   cd frontend && python -m http.server 8080   (open http://localhost:8080)
 Deploy:       push to GitHub, Settings -> Pages -> Source: GitHub Actions. See the PDF guide.
+
+Metric mode: capture, pin 2+ reference objects (credit card, A4, coin, tape length) at different distances, press Apply metric scale. Hover over the splat view to read X, Y, Depth.

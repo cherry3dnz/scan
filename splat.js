@@ -94,8 +94,9 @@ export function parsePLY(buf) {
 }
 
 export class SplatViewer {
-  constructor(canvas, { spinSpeed = 0.25 } = {}) {
+  constructor(canvas, { spinSpeed = 0.25, onHover = null } = {}) {
     this.canvas = canvas; this.spinSpeed = spinSpeed;
+    this.onHover = onHover; this.pointer = null; this.hovering = false; this.units = "units";
     const gl = canvas.getContext("webgl2", { antialias: false });
     if (!gl) throw new Error("WebGL2 is required");
     this.gl = gl;
@@ -127,7 +128,8 @@ export class SplatViewer {
     this._bindInput(); requestAnimationFrame((t) => this._frame(t));
   }
 
-  load(buf) {
+  load(buf, { units = "units" } = {}) {
+    this.units = units;                       // "m" when a metric scale has been applied
     const { data, count } = parsePLY(buf);
     this.base = data; this.count = count;
     this.sorted = new Float32Array(data.length);
@@ -168,12 +170,49 @@ export class SplatViewer {
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, sorted);
   }
 
+  _setPointer(e) {
+    const r = this.canvas.getBoundingClientRect();
+    this.pointer = { x: e.clientX - r.left, y: e.clientY - r.top };   // CSS pixels inside the canvas
+  }
+
+  // Finds the front-most Gaussian centre within 8 px of the pointer and reports its coordinates.
+  // Coordinates are those of the capture camera: X right, Y up, Depth = distance in front of the camera.
+  _pick(view, proj, W, H, dpr) {
+    if (!this.onHover) return;
+    if (!this.pointer || !this.count) {
+      if (this.hovering) { this.hovering = false; this.onHover(null); }
+      return;
+    }
+    const px = this.pointer.x * dpr, py = this.pointer.y * dpr, R2 = (8 * dpr) ** 2;
+    const { base, count } = this, fx = proj[0], fy = proj[5];
+    let best = -1, bestDepth = Infinity, bsx = 0, bsy = 0;
+    for (let i = 0; i < count; i++) {
+      const o = i * STRIDE, X = base[o], Y = base[o + 1], Z = base[o + 2];
+      const depth = -(view[2] * X + view[6] * Y + view[10] * Z + view[14]);
+      if (depth < 0.05 || depth >= bestDepth) continue;
+      const sx = (0.5 + 0.5 * ((fx * (view[0] * X + view[4] * Y + view[8] * Z + view[12])) / depth)) * W;
+      const sy = (0.5 - 0.5 * ((fy * (view[1] * X + view[5] * Y + view[9] * Z + view[13])) / depth)) * H;
+      const dx = sx - px, dy = sy - py;
+      if (dx * dx + dy * dy <= R2) { best = i; bestDepth = depth; bsx = sx; bsy = sy; }
+    }
+    if (best < 0) {
+      if (this.hovering) { this.hovering = false; this.onHover(null); }
+      return;
+    }
+    const o = best * STRIDE;
+    this.hovering = true;
+    this.onHover({ x: base[o], y: base[o + 1], z: base[o + 2], depth: -base[o + 2], units: this.units,
+      sx: bsx / dpr, sy: bsy / dpr, px: this.pointer.x, py: this.pointer.y });
+  }
+
   _bindInput() {
     const cv = this.canvas; let drag = null, pinch = null;
     cv.style.touchAction = "none";
-    cv.addEventListener("pointerdown", (e) => { drag = e.clientY; cv.setPointerCapture(e.pointerId); });
+    cv.addEventListener("pointerdown", (e) => { drag = e.clientY; cv.setPointerCapture(e.pointerId); this._setPointer(e); });
+    cv.addEventListener("pointerleave", (e) => { if (e.pointerType === "mouse") this.pointer = null; });
     cv.addEventListener("pointerup", () => (drag = null));
     cv.addEventListener("pointermove", (e) => {
+      this._setPointer(e);
       if (drag == null) return;
       this.phi = Math.max(-1.2, Math.min(1.2, this.phi + (e.clientY - drag) * 0.005)); drag = e.clientY;
     });
@@ -211,5 +250,6 @@ export class SplatViewer {
     gl.uniform2f(this.u.viewport, W, H);
     gl.uniform2f(this.u.focal, (proj[0] * W) / 2, (proj[5] * H) / 2);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.count);
+    this._pick(view, proj, W, H, dpr);
   }
 }
