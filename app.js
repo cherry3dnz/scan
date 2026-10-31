@@ -3,7 +3,7 @@ import { loadModel, estimateDepth, buildPLY, fitMetric } from "./pipeline.js";
 
 const $ = (id) => document.getElementById(id);
 const video = $("cam"), photo = $("photo"), loupe = $("loupe"), statusEl = $("status");
-const btn = $("capture"), retake = $("retake"), dl = $("download"), openScale = $("openScale"), openLabel = $("openLabel");
+const btn = $("capture"), backBtn = $("back"), retake = $("retake"), backLabel = $("backLabel"), dl = $("download"), openScale = $("openScale"), openLabel = $("openLabel");
 const refType = $("refType"), refLen = $("refLen"), addRef = $("addRef"), addLabel = $("addLabel"), applyScale = $("applyScale");
 const refList = $("refList"), refCount = $("refCount"), applyHint = $("applyHint"), lenRow = $("lenRow"), lenNote = $("lenNote");
 const cancelScale = $("cancelScale"), cancelPin = $("cancelPin");
@@ -13,7 +13,7 @@ const presets = (window.APP_CONFIG && window.APP_CONFIG.REFERENCE_PRESETS) || []
 const setStatus = (t) => (statusEl.textContent = t);
 
 const HINT_AIM = "Frame your subject. Include a credit card or coin if you want real-world size.";
-const MSG_RESULT = "3D model ready in relative depth. Add a real-world scale to measure in metres.";
+const MSG_RESULT = "Point cloud ";
 const MSG_METRIC = "Scale applied. Hover or tap a point to read its position in metres.";
 
 // ---------- screen states ----------
@@ -23,6 +23,7 @@ const STEP = { aim: 1, busy: 2, result: 2, error: 2, scale: 3, pin: 3, metric: 4
 const stepEls = [...document.querySelectorAll("#steps li")];
 let state = "aim";
 let metric = null;       // { a, b } once references are applied
+let scaleFrom = "result"; // screen the scale sheet returns to on Back
 function setState(s) {
   state = s; app.dataset.state = s;
   document.querySelectorAll("[data-states]").forEach((el) => { el.hidden = !el.dataset.states.split(" ").includes(s); });
@@ -31,8 +32,9 @@ function setState(s) {
   const m = s === "metric";
   dl.className = "btn " + (m ? "primary" : "ghost"); dl.style.order = m ? 2 : 1;
   openScale.className = "btn " + (m ? "ghost" : "primary"); openScale.style.order = m ? 1 : 2;
-  openLabel.textContent = metric ? "Edit scale" : "Add real-world scale";
-  vlabel.textContent = metric ? "3D · metres" : "3D preview · relative depth";
+  openLabel.textContent = metric ? "Edit scale" : "";
+  backLabel.textContent = s === "result" || s === "error" ? "Retake" : "Back";
+  vlabel.textContent = metric ? "3D · metres" : "3D preview";
 }
 
 // ---------- 3D hover read-out (bottom panel) ----------
@@ -226,7 +228,7 @@ function setPinMode(on) {
 }
 
 function scaleHint() {
-  if (refs.length === 0) return "Choose what you photographed, then add a reference and mark its two ends.";
+  if (refs.length === 0) return "Wanna add reference points.";
   if (refs.length === 1) return "1 of 2 references added. Add one at a different distance from the camera.";
   return "Ready. Apply the scale, or add another reference to check the error.";
 }
@@ -248,8 +250,8 @@ function renderRefs() {
   refCount.textContent = refs.length < 2 ? `${refs.length} of 2 references` : `${refs.length} references`;
   applyScale.disabled = refs.length < 2;                      // gated: no error after pressing it
   applyHint.hidden = refs.length >= 2;
-  applyHint.textContent = refs.length === 0 ? "Add two references at different distances to apply the scale."
-    : "Add one more reference at a different distance to apply the scale.";
+  applyHint.textContent = refs.length === 0 ? "Add two references to apply the scale."
+    : "Add one more reference to apply the scale.";
 }
 
 function commitPoint() {
@@ -325,11 +327,14 @@ cancelPin.addEventListener("click", backToSheet);   // also drops a half-placed 
 // Result / metric -> scale sheet
 openScale.addEventListener("click", () => {
   if (!frame || !depth) return;
+  scaleFrom = state === "metric" ? "metric" : "result";
   renderRefs(); setState("scale"); setStatus(scaleHint()); redraw();
 });
-cancelScale.addEventListener("click", () => {
-  setState(metric ? "metric" : "result"); setStatus(metric ? MSG_METRIC : MSG_RESULT);
-});
+function leaveScale() {
+  const to = scaleFrom === "metric" && metric ? "metric" : "result";
+  setState(to); setStatus(to === "metric" ? MSG_METRIC : MSG_RESULT);
+}
+cancelScale.addEventListener("click", leaveScale);
 
 // Sheet -> full-screen pinning for one reference
 addRef.addEventListener("click", () => {
@@ -382,11 +387,20 @@ btn.addEventListener("click", async () => {
   }
 });
 
-retake.addEventListener("click", () => {
+function toAim() {
   setPinMode(false);
   showPhoto(false); frame = null; depth = null; metric = null; lastPly = null; pending = null; preview = null;
   refs = []; renderRefs();
   setState("aim"); setStatus(modelMsg || HINT_AIM);
+}
+
+// Back: one step towards the camera. pin uses its own Cancel button (the header is hidden there).
+retake.addEventListener("click", toAim);
+backBtn.addEventListener("click", () => {
+  if (busy) return;
+  if (state === "metric") { scaleFrom = "result"; renderRefs(); setState("scale"); setStatus(scaleHint()); redraw(); }
+  else if (state === "scale") leaveScale();
+  else if (state === "result" || state === "error") toAim();
 });
 
 dl.addEventListener("click", () => {
