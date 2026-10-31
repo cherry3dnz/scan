@@ -3,55 +3,123 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Photo to 3D Gaussian Splat</title>
+<title>Syn3D</title>
 <style>
-  :root { --bg:#101114; --panel:#181a20; --fg:#e8e8ec; --accent:#4f8cff; --gold:#ffd54a; }
+  :root { --bg:#101114; --panel:#181a20; --raised:#262a33; --line:#2a2e38; --line2:#3a3f4b;
+          --fg:#e8e8ec; --soft:#c9ccd4; --muted:#9aa0ad; --accent:#2d6bea; --gold:#ffd54a; }
   * { box-sizing: border-box; }
   [hidden] { display:none !important; }
   html, body { height:100%; margin:0; background:var(--bg); color:var(--fg);
                font-family: system-ui, -apple-system, Segoe UI, sans-serif; overscroll-behavior:none; }
-  main { display:flex; flex-direction:column; height:100%; gap:6px; padding:6px; }
-  section { position:relative; flex:1 1 50%; min-height:0; background:var(--panel);
-            border-radius:10px; overflow:hidden; }
-  #viewer { width:100%; height:100%; display:block; }
+  button, select, input { font-family:inherit; }
+  button { cursor:pointer; color:inherit; }
 
-  /* top panel: status bar / stage (video or photo) / control dock, stacked so nothing covers the image */
-  #top { display:flex; flex-direction:column; }
-  #status { flex:none; padding:6px 10px; font-size:13px; line-height:1.3; max-height:5.4em; overflow:auto; }
-  #stage { position:relative; flex:1 1 0; min-height:0; background:#000; overflow:hidden;
-           user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; }
+  /* one column, top to bottom: title bar / step bar / status banner / content / action dock.
+     #app[data-state] (aim | busy | result | scale | pin | metric | error) decides what is visible. */
+  #app { display:flex; flex-direction:column; height:100%; max-width:760px; margin:0 auto; }
+
+  #bar { flex:none; display:flex; align-items:center; justify-content:space-between; height:56px; padding:0 8px 0 16px; }
+  #bar h1 { margin:0; font-size:17px; font-weight:600; letter-spacing:-.01em; }
+  .textbtn { height:44px; padding:0 12px; display:inline-flex; align-items:center; gap:6px; background:none;
+             border:0; border-radius:10px; color:var(--soft); font-size:14px; }
+
+  /* progress arrows: completed and current steps are filled blue, upcoming steps stay grey */
+  #steps { flex:none; display:flex; margin:0; padding:0 16px 12px; list-style:none; }
+  #steps li { flex:1; min-width:0; height:38px; display:flex; align-items:center; justify-content:center;
+              padding:0 12px 0 20px; margin-left:-9px; white-space:nowrap; font-size:11px; font-weight:500;
+              background:var(--raised); color:var(--muted);
+              clip-path:polygon(0 0, calc(100% - 12px) 0, 100% 50%, calc(100% - 12px) 100%, 0 100%, 12px 50%); }
+  #steps li:first-child { margin-left:0; padding-left:12px;
+              clip-path:polygon(0 0, calc(100% - 12px) 0, 100% 50%, calc(100% - 12px) 100%, 0 100%); border-radius:8px 0 0 8px; }
+  #steps li:last-child { padding-right:8px;
+              clip-path:polygon(0 0, 100% 0, 100% 100%, 0 100%, 12px 50%); border-radius:0 8px 8px 0; }
+  #steps li.done, #steps li.active { background:var(--accent); color:#fff; }
+  #steps li.active { font-weight:700; }
+  #steps li.done::before { content:"✓"; margin-right:4px; font-weight:700; }
+
+  #status { flex:none; margin:0 16px 12px; padding:10px 12px; background:var(--panel); border:1px solid var(--line);
+            border-radius:10px; font-size:13px; line-height:1.4; color:var(--soft); max-height:5.6em; overflow:auto; }
+
+  #content { flex:1 1 0; min-height:0; display:flex; flex-direction:column; gap:10px; padding:0 16px; }
+  #stage, #bottom { position:relative; flex:1 1 0; min-height:0; border-radius:14px; overflow:hidden;
+                    border:1px solid var(--line); background:#000; }
+  #stage { user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; }
+  #bottom { display:none; background:#0a0b0e; }
+  #viewer { width:100%; height:100%; display:block; }
   #cam { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; background:#000; }
   #photo { position:absolute; inset:0; width:100%; height:100%; touch-action:none; cursor:crosshair; }
-  .dock { flex:none; display:flex; flex-direction:column; gap:6px; padding:8px; background:#0c0d10; }
-  .row { display:flex; flex-wrap:wrap; gap:6px; align-items:center; justify-content:center; }
 
-  /* full-screen pinning mode: 3D viewer hidden, photo gets the whole screen */
-  main.pinning { padding:0; gap:0; }
-  main.pinning #bottom { display:none; }
-  main.pinning #top { border-radius:0; flex-basis:100%; }
-  main.pinning #thumb { display:none !important; }
-  main.pinning .actions { display:none; }
-  main.pinning #status { font-size:12px; padding:5px 8px; }
-  main.pinning .dock { padding:6px 8px calc(6px + env(safe-area-inset-bottom)); }
+  .tag { position:absolute; left:10px; top:10px; z-index:2; padding:3px 8px; border-radius:10px;
+         background:rgba(0,0,0,.6); font-size:11px; pointer-events:none; }
+  #vhint { position:absolute; left:0; right:0; bottom:10px; text-align:center; font-size:12px;
+           color:var(--muted); pointer-events:none; }
+  #guide { position:absolute; inset:0; pointer-events:none; }
+  #guide i { position:absolute; width:28px; height:28px; border:2px solid var(--fg); }
+  #guide i:nth-child(1) { left:16px; top:16px; border-right:0; border-bottom:0; border-top-left-radius:8px; }
+  #guide i:nth-child(2) { right:16px; top:16px; border-left:0; border-bottom:0; border-top-right-radius:8px; }
+  #guide i:nth-child(3) { left:16px; bottom:16px; border-right:0; border-top:0; border-bottom-left-radius:8px; }
+  #guide i:nth-child(4) { right:16px; bottom:16px; border-left:0; border-top:0; border-bottom-right-radius:8px; }
 
-  button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:10px 18px;
-           font-size:15px; cursor:pointer; }
-  button.small { padding:8px 12px; font-size:13px; }
-  button:disabled { opacity:.5; cursor:default; }
-  button.secondary { background:#333844; }
-  button.done { background:#2e9d5b; }
-  select, input { background:#262a33; color:var(--fg); border:1px solid #3a3f4b; border-radius:6px;
-                  padding:7px 8px; font-size:14px; max-width:100%; }
-  #refLen { width:90px; }
-  .chip { background:#2d3340; border-radius:12px; padding:2px 2px 2px 10px; font-size:12px;
-          display:inline-flex; align-items:center; gap:4px; }
-  .chip button { background:none; padding:0 8px; font-size:14px; }
-  #thumb { position:absolute; top:10px; right:10px; width:84px; border-radius:6px;
-           border:2px solid #fff3; display:none; z-index:2; pointer-events:none; }
+  /* per-state layout */
+  #app[data-state=result] #bottom, #app[data-state=metric] #bottom { display:block; }
+  #app[data-state=metric] #stage { flex:.6 1 0; }
+  #app[data-state=metric] #bottom { flex:1.7 1 0; }
+  #app[data-state=scale] #stage { flex:none; height:min(30vh, 240px); }
+  #app[data-state=pin] #content { padding:0; gap:0; }
+  #app[data-state=pin] #stage { border:0; border-radius:0; }
+  #app[data-state=pin] #status { margin:0; border-radius:0; border-width:0 0 1px; padding:8px 16px; background:#0c0d10; }
+  #app[data-state=pin] #dock { background:#0c0d10; border-top:1px solid var(--line); }
+  #app[data-state=aim] #dock { justify-content:center; }
+
+  /* buttons: at most one filled (primary) button on screen */
+  .btn { height:48px; padding:0 16px; display:inline-flex; align-items:center; justify-content:center; gap:8px;
+         border-radius:12px; border:1px solid transparent; background:none; font-size:15px; }
+  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  .btn.ghost { border-color:var(--line2); color:var(--fg); }
+  .btn:disabled { opacity:.45; cursor:default; }
+  .btn svg, .textbtn svg { flex:none; }
+
+  #dock { flex:none; display:flex; gap:10px; padding:14px 16px calc(16px + env(safe-area-inset-bottom)); }
+  #dock .btn { flex:1; }
+  #dock .btn.primary { flex:1.5; }
+  #capture { flex:none; width:76px; height:76px; padding:0; border-radius:50%; border:4px solid var(--fg); background:none; }
+  #capture span { display:block; width:58px; height:58px; margin:auto; border-radius:50%; background:var(--fg); }
+  #capture:disabled { opacity:.45; cursor:default; }
+
+  /* scale sheet */
+  #refbar { flex:1 1 0; min-height:0; margin:0 -16px; padding:10px 16px calc(16px + env(safe-area-inset-bottom));
+            background:var(--panel); border-top:1px solid var(--line); border-radius:20px 20px 0 0;
+            overflow:auto; display:flex; flex-direction:column; gap:12px; }
+  .grab { flex:none; align-self:center; width:36px; height:4px; border-radius:2px; background:var(--line2); }
+  .sheethead { display:flex; align-items:baseline; justify-content:space-between; }
+  .sheethead strong { font-size:16px; }
+  .field { display:flex; flex-direction:column; gap:6px; }
+  label, .note { font-size:12px; color:var(--muted); }
+  .center { text-align:center; }
+  .selwrap { position:relative; }
+  .selwrap svg { position:absolute; right:12px; top:15px; pointer-events:none; }
+  select, input { height:48px; width:100%; padding:0 12px; background:var(--raised); color:var(--fg);
+                  border:1px solid var(--line2); border-radius:10px; font-size:15px; }
+  select { appearance:none; -webkit-appearance:none; padding-right:40px; }
+  #refList { display:flex; flex-wrap:wrap; gap:8px; }
+  #refList:empty { display:none; }
+  .chip { display:inline-flex; align-items:center; height:44px; padding-left:14px; background:#2d3340;
+          border-radius:22px; font-size:13px; }
+  .chip button { width:44px; height:44px; padding:0; background:none; border:0; display:flex;
+                 align-items:center; justify-content:center; color:var(--soft); }
+  .spacer { flex:1; }
+  .row2 { display:flex; gap:10px; }
+  .row2 .btn { flex:1; }
+  .row2 .btn.primary { flex:1.5; }
+
+  /* pinning overlays */
   #loupe { position:absolute; top:10px; right:10px; width:180px; height:180px; border:2px solid #fff;
            border-radius:10px; background:#000; pointer-events:none; z-index:3; }
-  #zoomTag { position:absolute; left:8px; bottom:8px; padding:2px 8px; font:12px ui-monospace, Menlo, Consolas, monospace;
+  #zoomTag { position:absolute; left:12px; bottom:20px; padding:2px 8px; font:12px ui-monospace, Menlo, Consolas, monospace;
              background:rgba(0,0,0,.6); border-radius:10px; pointer-events:none; z-index:2; }
+  #fitBtn { position:absolute; right:12px; bottom:12px; z-index:3; width:44px; height:44px; padding:0; border-radius:50%;
+            display:flex; align-items:center; justify-content:center; background:rgba(12,13,16,.85);
+            border:1px solid var(--line2); }
   #probe { position:absolute; width:16px; height:16px; margin:-8px 0 0 -8px; border:2px solid var(--gold);
            border-radius:50%; pointer-events:none; }
   #hover { position:absolute; padding:4px 8px; font:12px ui-monospace, Menlo, Consolas, monospace;
@@ -60,42 +128,96 @@
 </style>
 </head>
 <body>
-<main id="app">
-  <section id="top">
-    <div id="status">Starting camera…</div>
+<main id="app" data-state="aim">
+
+  <header id="bar" data-states="aim busy result scale metric error">
+    <h1>Syn3D</h1>
+    <button id="retake" class="textbtn" data-states="result metric error" hidden>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+      Retake
+    </button>
+  </header>
+
+  <ol id="steps" data-states="aim busy result scale metric error">
+    <li>1 Capture</li>
+    <li>2 Preview</li>
+    <li>3 Scale</li>
+    <li>4 Save</li>
+  </ol>
+
+  <div id="status" role="status">Starting camera…</div>
+
+  <div id="content">
     <div id="stage">
       <video id="cam" autoplay playsinline muted></video>
       <canvas id="photo" hidden></canvas>
-      <img id="thumb" alt="captured frame">
+      <div id="guide" data-states="aim" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <span class="tag" data-states="result scale metric" hidden>Photo</span>
       <canvas id="loupe" width="360" height="360" hidden></canvas>
       <div id="zoomTag" hidden></div>
+      <button id="fitBtn" aria-label="Fit photo to screen" title="Reset zoom" hidden>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+      </button>
     </div>
-    <div class="dock">
-      <div id="refbar" hidden>
-        <div class="row">
+
+    <section id="bottom">
+      <canvas id="viewer"></canvas>
+      <span class="tag" id="vlabel">3D preview · relative depth</span>
+      <span id="vhint">Drag to tilt · scroll or pinch to zoom</span>
+      <div id="probe" hidden></div>
+      <div id="hover" hidden></div>
+    </section>
+
+    <div id="refbar" data-states="scale" hidden>
+      <div class="grab"></div>
+      <div class="sheethead"><strong>Real-world scale</strong><span class="note" id="refCount">0 of 2 references</span></div>
+      <div class="field">
+        <label for="refType">Reference object</label>
+        <div class="selwrap">
           <select id="refType" title="Reference object"></select>
-          <input id="refLen" type="number" min="0" step="any" placeholder="mm" title="Real length in millimetres">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#9aa0ad" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
         </div>
-        <div class="row">
-          <button id="addRef" class="small secondary">Add reference</button>
-          <button id="applyScale" class="small">Apply metric scale</button>
-          <button id="fitBtn" class="small secondary" hidden title="Reset zoom">Fit</button>
-          <button id="doneBtn" class="small done" hidden>Done</button>
+        <div class="note" id="lenNote"></div>
+        <div id="lenRow" class="field" hidden>
+          <label for="refLen">Real length (mm)</label>
+          <input id="refLen" type="number" min="0" step="any" inputmode="decimal" placeholder="mm">
         </div>
-        <div class="row" id="refList"></div>
       </div>
-      <div class="row actions">
-        <button id="capture" disabled>📷 Capture &amp; Reconstruct</button>
-        <button id="retake" class="secondary" hidden>Retake</button>
-        <button id="download" class="secondary" disabled>Download .ply</button>
+      <div id="refList"></div>
+      <button id="addRef" class="btn ghost">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        <span id="addLabel">Add reference</span>
+      </button>
+      <div class="spacer"></div>
+      <div id="applyHint" class="note center"></div>
+      <div class="row2">
+        <button id="cancelScale" class="btn ghost">Cancel</button>
+        <button id="applyScale" class="btn primary" disabled>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>
+          Apply scale
+        </button>
       </div>
     </div>
-  </section>
-  <section id="bottom">
-    <canvas id="viewer"></canvas>
-    <div id="probe" hidden></div>
-    <div id="hover" hidden></div>
-  </section>
+  </div>
+
+  <footer id="dock" data-states="aim busy result pin metric">
+    <button id="capture" aria-label="Capture photo" data-states="aim" disabled><span></span></button>
+    <button id="working" class="btn primary" data-states="busy" disabled hidden>Working…</button>
+    <button id="download" class="btn ghost" data-states="result metric" hidden>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 20h16"/></svg>
+      Download .ply
+    </button>
+    <button id="openScale" class="btn primary" data-states="result metric" hidden>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 17L17 3l4 4L7 21z"/><path d="M7 13l2 2M10 10l2 2M13 7l2 2"/></svg>
+      <span id="openLabel">Add real-world scale</span>
+    </button>
+    <button id="cancelPin" class="btn ghost" data-states="pin" hidden>Cancel</button>
+    <button id="doneBtn" class="btn primary" data-states="pin" hidden>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>
+      Done
+    </button>
+  </footer>
+
 </main>
 <script src="config.js"></script>
 <script type="module" src="app.js"></script>

@@ -2,13 +2,38 @@ import { SplatViewer } from "./splat.js";
 import { loadModel, estimateDepth, buildPLY, fitMetric } from "./pipeline.js";
 
 const $ = (id) => document.getElementById(id);
-const video = $("cam"), photo = $("photo"), loupe = $("loupe"), statusEl = $("status"), thumb = $("thumb");
-const btn = $("capture"), retake = $("retake"), dl = $("download");
-const refbar = $("refbar"), refType = $("refType"), refLen = $("refLen"), addRef = $("addRef"), applyScale = $("applyScale"), refList = $("refList");
-const hoverEl = $("hover"), probeEl = $("probe"), bottom = $("bottom");
+const video = $("cam"), photo = $("photo"), loupe = $("loupe"), statusEl = $("status");
+const btn = $("capture"), retake = $("retake"), dl = $("download"), openScale = $("openScale"), openLabel = $("openLabel");
+const refType = $("refType"), refLen = $("refLen"), addRef = $("addRef"), addLabel = $("addLabel"), applyScale = $("applyScale");
+const refList = $("refList"), refCount = $("refCount"), applyHint = $("applyHint"), lenRow = $("lenRow"), lenNote = $("lenNote");
+const cancelScale = $("cancelScale"), cancelPin = $("cancelPin");
+const hoverEl = $("hover"), probeEl = $("probe"), bottom = $("bottom"), vlabel = $("vlabel");
 const app = $("app"), stage = $("stage"), zoomTag = $("zoomTag"), doneBtn = $("doneBtn"), fitBtn = $("fitBtn");
 const presets = (window.APP_CONFIG && window.APP_CONFIG.REFERENCE_PRESETS) || [];
 const setStatus = (t) => (statusEl.textContent = t);
+
+const HINT_AIM = "Frame your subject. Include a credit card or coin if you want real-world size.";
+const MSG_RESULT = "3D model ready in relative depth. Add a real-world scale to measure in metres.";
+const MSG_METRIC = "Scale applied. Hover or tap a point to read its position in metres.";
+
+// ---------- screen states ----------
+// aim -> busy -> result -> scale <-> pin ; scale -> metric ; metric -> scale (edit) ; any -> aim (retake)
+// Elements marked data-states="..." are shown only in those states; the step bar follows the state.
+const STEP = { aim: 1, busy: 2, result: 2, error: 2, scale: 3, pin: 3, metric: 4 };
+const stepEls = [...document.querySelectorAll("#steps li")];
+let state = "aim";
+let metric = null;       // { a, b } once references are applied
+function setState(s) {
+  state = s; app.dataset.state = s;
+  document.querySelectorAll("[data-states]").forEach((el) => { el.hidden = !el.dataset.states.split(" ").includes(s); });
+  stepEls.forEach((li, i) => { li.classList.toggle("done", i + 1 < STEP[s]); li.classList.toggle("active", i + 1 === STEP[s]); });
+  // Result: Download (secondary) + Add scale (primary). Metric: Edit scale (secondary) + Download (primary).
+  const m = s === "metric";
+  dl.className = "btn " + (m ? "primary" : "ghost"); dl.style.order = m ? 2 : 1;
+  openScale.className = "btn " + (m ? "ghost" : "primary"); openScale.style.order = m ? 1 : 2;
+  openLabel.textContent = metric ? "Edit scale" : "Add real-world scale";
+  vlabel.textContent = metric ? "3D · metres" : "3D preview · relative depth";
+}
 
 // ---------- 3D hover read-out (bottom panel) ----------
 const fmt = (v, u) => (u === "m" ? v.toFixed(3) + " m" : v.toFixed(2) + " u");
@@ -26,20 +51,21 @@ const viewer = new SplatViewer($("viewer"), { onHover });
 // ---------- state ----------
 let frame = null;        // full-resolution captured canvas
 let depth = null;        // { img, disp, w, h, W, H } relative depth kept for re-fitting
-let metric = null;       // { a, b } once references are applied
 let refs = [];           // [{ p1, p2, lengthM, label }] pixel coords in the full-resolution frame
 let pending = null;      // reference being pinned: { label, lengthM, pts: [] }
 let preview = null;      // point currently being placed (finger/mouse down), image pixels
 let lastPly = null, busy = false, modelMsg = "";
 
 // pinning mode / zoom state
-let pinMode = false;                       // full-screen pinning layout (3D viewer hidden)
+let pinMode = false;                       // full-screen pinning (3D viewer hidden)
 const view = { z: 1, cx: 0, cy: 0 };       // zoom relative to "fit" (>= 1) and the image point at the stage centre
 const ptrs = new Map();                    // active pointers: id -> {x, y} in stage CSS pixels
 let gesture = "none";                      // "none" | "pin" | "pan" | "pinch"
 let pinch = null, panLast = null, curPos = null, raf = 0;
 const MAX_CSS_SCALE = 20;                  // max on-screen CSS px per image pixel
 const MARGIN = 40;                         // image may be panned this far (CSS px) past the stage edge
+
+setState("aim");
 
 // ---------- camera + model ----------
 async function startCamera() {
@@ -48,28 +74,30 @@ async function startCamera() {
       video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
     await video.play();
     btn.disabled = false;
-    setStatus(modelMsg || "Camera ready. Loading depth model in the background…");
+    if (state === "aim") setStatus(modelMsg || HINT_AIM);
   } catch (e) {
     setStatus("Camera unavailable: " + e.message + " (HTTPS and permission are required)");
   }
 }
 // Warm up the model while the user frames the shot (first visit downloads ~100 MB, then it is cached).
-loadModel((m) => { modelMsg = m; if (!busy) setStatus(m); })
-  .then(() => { modelMsg = "Camera and model ready. Press Capture."; if (!busy) setStatus(modelMsg); })
+loadModel((m) => { modelMsg = m; if (!busy && state === "aim") setStatus(m); })
+  .then(() => { modelMsg = HINT_AIM; if (!busy && state === "aim") setStatus(modelMsg); })
   .catch((e) => setStatus("Model failed to load: " + e.message));
 
 // ---------- reference picker ----------
 presets.forEach((p, i) => refType.add(new Option(p.label, i)));
 function syncPreset() {
-  const p = presets[refType.value];
-  refLen.value = p && p.mm ? p.mm : "";
+  const p = presets[refType.value], fixed = !!(p && p.mm);
+  refLen.value = fixed ? p.mm : "";
+  lenRow.hidden = fixed;                           // the length box only appears for "other" / tape
+  lenNote.textContent = fixed ? `Length pre-filled: ${p.mm} mm` : "";
   if (p && !p.mm) refLen.focus();
 }
 refType.addEventListener("change", syncPreset);
 syncPreset();
 
 function showPhoto(on) {
-  photo.hidden = !on; refbar.hidden = !on; retake.hidden = !on; video.hidden = on; loupe.hidden = true;
+  photo.hidden = !on; video.hidden = on; loupe.hidden = true;
   if (!on) zoomTag.hidden = true;
 }
 
@@ -187,35 +215,51 @@ function redraw() {
 const schedule = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; redraw(); }); };
 new ResizeObserver(() => { if (frame) { clampView(); redraw(); } }).observe(stage);
 
-// ---------- pinning mode ----------
+// ---------- pinning mode (zoom/pan state; the layout itself follows the "pin" screen state) ----------
 function setPinMode(on) {
   if (pinMode === on) return;
-  pinMode = on; app.classList.toggle("pinning", on);
-  doneBtn.hidden = fitBtn.hidden = !on;
+  pinMode = on;
+  fitBtn.hidden = !on;
   ptrs.clear(); gesture = "none"; preview = null; curPos = null;
-  if (!on) { pending = null; addRef.textContent = "Add reference"; }
+  if (!on) pending = null;
   if (frame) { clampView(); redraw(); }
+}
+
+function scaleHint() {
+  if (refs.length === 0) return "Choose what you photographed, then add a reference and mark its two ends.";
+  if (refs.length === 1) return "1 of 2 references added. Add one at a different distance from the camera.";
+  return "Ready. Apply the scale, or add another reference to check the error.";
+}
+function backToSheet() {
+  setPinMode(false); setState("scale"); setStatus(scaleHint()); redraw();
 }
 
 function renderRefs() {
   refList.innerHTML = "";
   refs.forEach((r, i) => {
     const chip = document.createElement("span"); chip.className = "chip";
-    chip.textContent = `${i + 1}. ${r.label} ${(r.lengthM * 1000).toFixed(r.lengthM < 0.1 ? 2 : 0)} mm`;
-    const x = document.createElement("button"); x.textContent = "✕"; x.title = "Remove";
-    x.onclick = () => { refs.splice(i, 1); renderRefs(); redraw(); };
+    chip.textContent = `${i + 1} · ${r.label} · ${(r.lengthM * 1000).toFixed(r.lengthM < 0.1 ? 2 : 0)} mm`;
+    const x = document.createElement("button"); x.title = "Remove"; x.setAttribute("aria-label", "Remove reference " + (i + 1));
+    x.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>';
+    x.onclick = () => { refs.splice(i, 1); renderRefs(); redraw(); if (state === "scale") setStatus(scaleHint()); };
     chip.append(x); refList.append(chip);
   });
+  addLabel.textContent = refs.length ? "Add another reference" : "Add reference";
+  refCount.textContent = refs.length < 2 ? `${refs.length} of 2 references` : `${refs.length} references`;
+  applyScale.disabled = refs.length < 2;                      // gated: no error after pressing it
+  applyHint.hidden = refs.length >= 2;
+  applyHint.textContent = refs.length === 0 ? "Add two references at different distances to apply the scale."
+    : "Add one more reference at a different distance to apply the scale.";
 }
 
 function commitPoint() {
   pending.pts.push(preview); preview = null;
-  if (pending.pts.length === 2) {
+  if (pending.pts.length === 2) {                  // auto-advance: reference saved, back to the sheet
     refs.push({ p1: pending.pts[0], p2: pending.pts[1], lengthM: pending.lengthM, label: pending.label });
-    pending = null; addRef.textContent = "Add reference"; renderRefs();
-    setStatus(refs.length < 2 ? "Saved. Add one more reference at a different distance, then Apply metric scale."
-                              : "Saved. Add a third reference to check the error, or press Apply metric scale.");
-  } else setStatus(`End 1 set. Pinch/drag to move around if needed, then press and drag to place end 2 of "${pending.label}".`);
+    pending = null; renderRefs(); backToSheet();
+    return;
+  }
+  setStatus(`End 1 set. Now press and drag to place end 2 of "${pending.label}". Pinch or drag to move around first if needed.`);
   redraw();
 }
 
@@ -275,26 +319,27 @@ photo.addEventListener("wheel", (e) => {
 photo.addEventListener("contextmenu", (e) => e.preventDefault());
 
 fitBtn.addEventListener("click", () => { resetView(); redraw(); });
-doneBtn.addEventListener("click", () => {
-  setPinMode(false);
-  setStatus(refs.length < 2 ? "Add at least two references (at different distances), then Apply metric scale."
-                            : "Press Apply metric scale, or add more references.");
+doneBtn.addEventListener("click", backToSheet);
+cancelPin.addEventListener("click", backToSheet);   // also drops a half-placed reference (setPinMode(false) clears it)
+
+// Result / metric -> scale sheet
+openScale.addEventListener("click", () => {
+  if (!frame || !depth) return;
+  renderRefs(); setState("scale"); setStatus(scaleHint()); redraw();
+});
+cancelScale.addEventListener("click", () => {
+  setState(metric ? "metric" : "result"); setStatus(metric ? MSG_METRIC : MSG_RESULT);
 });
 
+// Sheet -> full-screen pinning for one reference
 addRef.addEventListener("click", () => {
   if (!frame) return;
-  if (pending) {                                   // cancel the reference being pinned
-    pending = null; preview = null; addRef.textContent = "Add reference"; redraw();
-    setStatus("Cancelled. Add another reference or press Done.");
-    return;
-  }
   const mm = parseFloat(refLen.value);
-  if (!(mm > 0)) { setStatus("Enter the real length in mm first."); refLen.focus(); return; }
+  if (!(mm > 0)) { setStatus("Enter the real length in mm first."); lenRow.hidden = false; refLen.focus(); return; }
   const p = presets[refType.value];
   pending = { label: p ? p.label.split(" (")[0].split(":")[0] : "Reference", lengthM: mm / 1000, pts: [] };
-  addRef.textContent = "Cancel";
-  setPinMode(true);                                // full-screen photo, 3D viewer hidden
-  setStatus(`Pinch to zoom, drag to pan. Then press and drag to place end 1 of "${pending.label}" (${mm} mm); release to set.`);
+  setState("pin"); setPinMode(true);               // full-screen photo, 3D viewer hidden
+  setStatus(`Press and drag to place end 1 of "${pending.label}" (${mm} mm); release to set. Pinch to zoom, drag to pan.`);
   redraw();
 });
 
@@ -306,12 +351,13 @@ function rebuild() {
 applyScale.addEventListener("click", () => {
   if (!depth) { setStatus("Depth is still being estimated - wait a moment, then apply the scale."); return; }
   const fit = fitMetric(refs, depth.disp, depth.w, depth.h, depth.W, depth.H);
-  if (!fit.ok) { setStatus("Cannot apply scale: " + fit.reason + "."); return; }   // stay in pinning mode so it can be fixed
-  setPinMode(false);                               // bring the 3D viewer back
+  if (!fit.ok) { setStatus("Cannot apply scale: " + fit.reason + "."); return; }   // stay on the sheet so it can be fixed
   metric = { a: fit.a, b: fit.b };
   const n = rebuild();
-  setStatus(`Metric scale applied (${n.toLocaleString()} Gaussians, units = metres). Reference errors: ` +
-    fit.errorsPct.map((v) => v.toFixed(1) + "%").join(", ") + (fit.warning ? ". Note: " + fit.warning : "") + ". Drag to tilt, scroll/pinch to zoom.");
+  setState("metric");
+  setStatus(`Scale applied (${n.toLocaleString()} Gaussians, metres). Reference errors: ` +
+    fit.errorsPct.map((v) => v.toFixed(1) + "%").join(", ") + (fit.warning ? ". Note: " + fit.warning : "") +
+    ". Hover or tap a point to read its position.");
 });
 
 // ---------- capture / retake / download ----------
@@ -322,18 +368,17 @@ btn.addEventListener("click", async () => {
     frame = document.createElement("canvas");
     frame.width = video.videoWidth; frame.height = video.videoHeight;
     frame.getContext("2d").drawImage(video, 0, 0);
-    thumb.src = frame.toDataURL("image/jpeg", 0.7); thumb.style.display = "block";
     refs = []; pending = null; preview = null; metric = null; depth = null; renderRefs();
     setPinMode(false); resetView();
-    showPhoto(true); redraw();
+    showPhoto(true); setState("busy"); redraw();
 
     depth = await estimateDepth(frame, frame.width, frame.height, setStatus);
     setStatus("Rendering Gaussian splats…");
     const n = rebuild();
-    dl.disabled = false;
-    setStatus(`Relative depth ready (${n.toLocaleString()} Gaussians). For metres: tap Add reference to pin 2+ reference objects (full-screen, pinch to zoom), then Apply metric scale. Drag to tilt, scroll/pinch to zoom.`);
+    setState("result");
+    setStatus(`${MSG_RESULT} (${n.toLocaleString()} Gaussians)`);
   } catch (e) {
-    console.error(e); setStatus("Error: " + e.message);
+    console.error(e); setStatus("Error: " + e.message); setState("error");
   } finally {
     busy = false; btn.disabled = false;
   }
@@ -341,8 +386,9 @@ btn.addEventListener("click", async () => {
 
 retake.addEventListener("click", () => {
   setPinMode(false);
-  showPhoto(false); thumb.style.display = "none"; frame = null; pending = null; preview = null; addRef.textContent = "Add reference";
-  setStatus("Camera ready. Press Capture.");
+  showPhoto(false); frame = null; depth = null; metric = null; lastPly = null; pending = null; preview = null;
+  refs = []; renderRefs();
+  setState("aim"); setStatus(modelMsg || HINT_AIM);
 });
 
 dl.addEventListener("click", () => {
@@ -352,4 +398,5 @@ dl.addEventListener("click", () => {
   a.download = metric ? "pointcloud_metric.ply" : "pointcloud.ply"; a.click();
 });
 
+renderRefs();
 startCamera();
