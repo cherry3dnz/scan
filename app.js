@@ -355,9 +355,7 @@ applyScale.addEventListener("click", () => {
   metric = { a: fit.a, b: fit.b };
   const n = rebuild();
   setState("metric");
-  setStatus(`Scale applied (${n.toLocaleString()} Gaussians, metres). Reference errors: ` +
-    fit.errorsPct.map((v) => v.toFixed(1) + "%").join(", ") + (fit.warning ? ". Note: " + fit.warning : "") +
-    ". Hover or tap a point to read its position.");
+  setStatus("Scale applied");
 });
 
 // ---------- capture / retake / download ----------
