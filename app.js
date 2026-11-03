@@ -1,5 +1,5 @@
 import { SplatViewer } from "./splat.js";
-import { loadModel, estimateDepth, buildPLY, fitMetric } from "./pipeline.js";
+import { loadModel, estimateDepth, buildPLY, fitMetric, filterPLY } from "./pipeline.js";
 
 const $ = (id) => document.getElementById(id);
 const video = $("cam"), photo = $("photo"), loupe = $("loupe"), statusEl = $("status");
@@ -9,12 +9,15 @@ const refList = $("refList"), refCount = $("refCount"), applyHint = $("applyHint
 const cancelScale = $("cancelScale"), cancelPin = $("cancelPin");
 const hoverEl = $("hover"), probeEl = $("probe"), bottom = $("bottom"), vlabel = $("vlabel");
 const app = $("app"), stage = $("stage"), zoomTag = $("zoomTag"), doneBtn = $("doneBtn"), fitBtn = $("fitBtn");
+const selLayer = $("selLayer"), selCanvas = $("selCanvas"), selToggle = $("selToggle"), selShapeBtn = $("selShape");
+const selClear = $("selClear"), selDelete = $("selDelete"), selDelLabel = $("selDelLabel"), selUndo = $("selUndo"), vhint = $("vhint");
 const presets = (window.APP_CONFIG && window.APP_CONFIG.REFERENCE_PRESETS) || [];
 const setStatus = (t) => (statusEl.textContent = t);
 
 const HINT_AIM = "Frame your subject. Include a credit card or coin if you want real-world size.";
 const MSG_RESULT = "Point cloud ";
-const MSG_METRIC = "Scale applied. Hover or tap a point to read its position in metres.";
+const MSG_METRIC = "Scale applied. Hover or tap a point to read its position in metres, or use Select to delete points.";
+const HINT_SELECT = "Drag over the 3D view to select points (adds to the selection; Shift-drag removes). Then press Delete.";
 
 // ---------- screen states ----------
 // aim -> busy -> result -> scale <-> pin ; scale -> metric ; metric -> scale (edit) ; any -> aim (retake)
@@ -24,6 +27,10 @@ const stepEls = [...document.querySelectorAll("#steps li")];
 let state = "aim";
 let metric = null;       // { a, b } once references are applied
 let scaleFrom = "result"; // screen the scale sheet returns to on Back
+let selMode = false;      // select tool active in the metric view
+let selShape = "box";     // "box" | "lasso"
+let selDrag = null;       // drag in progress: { pts, start, cur, sub }
+const undoStack = [];     // previous PLY buffers, newest last
 function setState(s) {
   state = s; app.dataset.state = s;
   document.querySelectorAll("[data-states]").forEach((el) => { el.hidden = !el.dataset.states.split(" ").includes(s); });
@@ -35,6 +42,8 @@ function setState(s) {
   openLabel.textContent = metric ? "Edit scale" : "";
   backLabel.textContent = s === "result" || s === "error" ? "Retake" : "Back";
   vlabel.textContent = metric ? "3D · metres" : "3D preview";
+  if (s !== "metric" && selMode) setSelectMode(false);
+  if (s === "metric") updateTrim();
 }
 
 // ---------- 3D hover read-out (bottom panel) ----------
@@ -349,6 +358,7 @@ addRef.addEventListener("click", () => {
 });
 
 function rebuild() {
+  undoStack.length = 0;                            // a rebuild starts again from the full cloud
   lastPly = buildPLY(depth.img, depth.disp, metric);
   return viewer.load(lastPly, { units: metric ? "m" : "units" });
 }
@@ -357,10 +367,11 @@ applyScale.addEventListener("click", () => {
   if (!depth) { setStatus("Depth is still being estimated - wait a moment, then apply the scale."); return; }
   const fit = fitMetric(refs, depth.disp, depth.w, depth.h, depth.W, depth.H);
   if (!fit.ok) { setStatus("Cannot apply scale: " + fit.reason + "."); return; }   // stay on the sheet so it can be fixed
+  const hadEdits = undoStack.length > 0;
   metric = { a: fit.a, b: fit.b };
   const n = rebuild();
   setState("metric");
-  setStatus("Scale applied");
+  setStatus(hadEdits ? "Scale applied. Earlier deletions were reset, so delete those points again." : "Scale applied");
 });
 
 // ---------- capture / retake / download ----------
@@ -388,6 +399,7 @@ btn.addEventListener("click", async () => {
 });
 
 function toAim() {
+  undoStack.length = 0;
   setPinMode(false);
   showPhoto(false); frame = null; depth = null; metric = null; lastPly = null; pending = null; preview = null;
   refs = []; renderRefs();
@@ -408,6 +420,105 @@ dl.addEventListener("click", () => {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([lastPly], { type: "application/octet-stream" }));
   a.download = metric ? "pointcloud_metric.ply" : "pointcloud.ply"; a.click();
+});
+
+// ---------- trim tool (metric view): select points with a box or lasso, delete, undo ----------
+const SHAPE_ICONS = {
+  box: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="1.5" stroke-dasharray="3 3"/></svg>',
+  lasso: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4C7 4 3.5 6.6 3.5 10s3.5 6 8.5 6c1.2 0 2.3-.15 3.3-.4"/><path d="M12 4c5 0 8.5 2.6 8.5 6s-3.5 6-8.5 6"/><path d="M9 16c-1 1.4-.8 3.2 1 4s3.2-.4 3-2"/></svg>',
+};
+function updateTrim() {
+  const n = viewer.selCount || 0;
+  selToggle.classList.toggle("on", selMode); selToggle.setAttribute("aria-pressed", String(selMode));
+  selShapeBtn.hidden = !selMode; selShapeBtn.innerHTML = SHAPE_ICONS[selShape];
+  selShapeBtn.title = selShapeBtn.ariaLabel = "Selection shape: " + selShape + " (tap to switch)";
+  selClear.hidden = !selMode || n === 0;
+  selDelete.hidden = !selMode; selDelete.disabled = n === 0;
+  selDelLabel.textContent = n ? `Delete ${n.toLocaleString()}` : "Delete";
+  selUndo.disabled = undoStack.length === 0;
+  vhint.hidden = selMode;
+}
+function setSelectMode(on) {
+  selMode = on; selDrag = null; drawSel();
+  viewer.spinSpeed = on ? 0 : 0.25;                // hold the view still so the selection matches what is seen
+  viewer.pointer = null;
+  selLayer.hidden = !on;
+  if (!on) viewer.clearSelection();
+  updateTrim();
+}
+function selPoly() {
+  if (!selDrag) return [];
+  if (selShape === "lasso") return selDrag.pts;
+  const a = selDrag.start, b = selDrag.cur || a;
+  return [{ x: a.x, y: a.y }, { x: b.x, y: a.y }, { x: b.x, y: b.y }, { x: a.x, y: b.y }];
+}
+function drawSel() {
+  const W = selLayer.clientWidth, H = selLayer.clientHeight, dpr = window.devicePixelRatio || 1;
+  if (selCanvas.width !== Math.round(W * dpr) || selCanvas.height !== Math.round(H * dpr)) {
+    selCanvas.width = Math.round(W * dpr); selCanvas.height = Math.round(H * dpr);
+  }
+  const g = selCanvas.getContext("2d");
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, selCanvas.width, selCanvas.height);
+  const poly = selPoly();
+  if (poly.length < 2) return;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.beginPath(); poly.forEach((p, i) => (i ? g.lineTo(p.x, p.y) : g.moveTo(p.x, p.y))); g.closePath();
+  g.fillStyle = selDrag.sub ? "rgba(79,224,255,.12)" : "rgba(255,213,74,.14)"; g.fill();
+  g.setLineDash([6, 5]);
+  for (const [c, w] of [["rgba(0,0,0,.8)", 3.5], [selDrag.sub ? "#4fe0ff" : "#ffd54a", 1.5]]) { g.strokeStyle = c; g.lineWidth = w; g.stroke(); }
+  g.setLineDash([]);
+}
+const selPos = (e) => { const r = selLayer.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+selLayer.addEventListener("pointerdown", (e) => {
+  if (!selMode || selDrag) return;
+  e.preventDefault(); selLayer.setPointerCapture(e.pointerId);
+  const p = selPos(e);
+  selDrag = { pts: [p], start: p, cur: p, sub: e.shiftKey };
+  drawSel();
+});
+selLayer.addEventListener("pointermove", (e) => {
+  if (!selDrag) return;
+  const p = selPos(e); selDrag.cur = p;
+  if (selShape === "lasso") selDrag.pts.push(p);
+  drawSel();
+});
+selLayer.addEventListener("pointerup", () => {
+  if (!selDrag) return;
+  const poly = selPoly(), sub = selDrag.sub;
+  selDrag = null; drawSel();
+  const xs = poly.map((p) => p.x), ys = poly.map((p) => p.y);
+  const big = Math.max(...xs) - Math.min(...xs) > 4 && Math.max(...ys) - Math.min(...ys) > 4;
+  if (poly.length >= 3 && big) {
+    const n = viewer.selectPoly(poly, sub ? "sub" : "add");
+    setStatus(n ? `${n.toLocaleString()} points selected. Press Delete to remove them, or drag again to adjust.` : "No points in that area. " + HINT_SELECT);
+  }
+  updateTrim();
+});
+selLayer.addEventListener("pointercancel", () => { selDrag = null; drawSel(); });
+selLayer.addEventListener("wheel", (e) => { e.preventDefault(); viewer.zoomBy(e.deltaY > 0 ? 1.08 : 0.92); }, { passive: false });
+
+selToggle.addEventListener("click", () => {
+  setSelectMode(!selMode);
+  setStatus(selMode ? HINT_SELECT : MSG_METRIC);
+});
+selShapeBtn.addEventListener("click", () => { selShape = selShape === "box" ? "lasso" : "box"; updateTrim(); setStatus(selShape === "box" ? "Box selection." : "Lasso selection: draw around the points."); });
+selClear.addEventListener("click", () => { viewer.clearSelection(); updateTrim(); setStatus(HINT_SELECT); });
+selDelete.addEventListener("click", () => {
+  const n = viewer.selCount;
+  if (!n || !lastPly) return;
+  const prev = lastPly, del = viewer.deleteSelected();
+  if (!del) return;
+  undoStack.push(prev); if (undoStack.length > 10) undoStack.shift();
+  lastPly = filterPLY(prev, del);
+  updateTrim();
+  setStatus(`Deleted ${n.toLocaleString()} points. ${viewer.count.toLocaleString()} remain. Download .ply saves the trimmed cloud.`);
+});
+selUndo.addEventListener("click", () => {
+  if (!undoStack.length) return;
+  lastPly = undoStack.pop();
+  const n = viewer.load(lastPly, { units: metric ? "m" : "units", keepView: true });
+  updateTrim();
+  setStatus(`Undone. ${n.toLocaleString()} points.`);
 });
 
 renderRefs();

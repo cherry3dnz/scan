@@ -81,6 +81,17 @@
   .btn:disabled { opacity:.45; cursor:default; }
   .btn svg, .textbtn svg { flex:none; }
 
+  /* trim toolbar (metric state): select / shape / clear / delete / undo */
+  #trim { position:absolute; left:8px; right:8px; bottom:8px; z-index:4; display:flex; flex-wrap:wrap; gap:6px; justify-content:center; }
+  #trim .tb { height:44px; min-width:44px; padding:0 12px; display:inline-flex; align-items:center; justify-content:center; gap:6px;
+              background:rgba(12,13,16,.88); border:1px solid var(--line2); border-radius:22px; color:var(--fg); font-size:13px; }
+  #trim .tb.on { border-color:var(--gold); color:var(--gold); }
+  #trim .tb.danger { border-color:#e5484d; color:#ff8085; }
+  #trim .tb:disabled { opacity:.4; cursor:default; }
+  #selLayer { position:absolute; inset:0; z-index:3; cursor:crosshair; touch-action:none; }
+  #selCanvas { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  #app[data-state=metric] #vhint { bottom:64px; }
+
   #dock { flex:none; display:flex; gap:10px; padding:14px 16px calc(16px + env(safe-area-inset-bottom)); }
   #dock .btn { flex:1; }
   #dock .btn.primary { flex:1.5; }
@@ -174,6 +185,24 @@
       <span id="vhint">Drag to tilt · scroll or pinch to zoom</span>
       <div id="probe" hidden></div>
       <div id="hover" hidden></div>
+      <div id="selLayer" hidden><canvas id="selCanvas"></canvas></div>
+      <div id="trim" data-states="metric" hidden>
+        <button id="selToggle" class="tb" aria-pressed="false" title="Select points to delete">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2" stroke-dasharray="3 3"/><path d="M12 9v6M9 12h6"/></svg>
+          Select
+        </button>
+        <button id="selShape" class="tb" title="Selection shape: box" aria-label="Selection shape: box" hidden></button>
+        <button id="selClear" class="tb" title="Clear selection" aria-label="Clear selection" hidden>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+        <button id="selDelete" class="tb danger" disabled hidden>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>
+          <span id="selDelLabel">Delete</span>
+        </button>
+        <button id="selUndo" class="tb" title="Undo delete" aria-label="Undo delete" disabled>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg>
+        </button>
+      </div>
     </section>
 
     <div id="refbar" data-states="scale" hidden>

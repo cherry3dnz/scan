@@ -128,26 +128,85 @@ export class SplatViewer {
     this._bindInput(); requestAnimationFrame((t) => this._frame(t));
   }
 
-  load(buf, { units = "units" } = {}) {
+  // keepView: keep the current camera (used after an edit/undo) instead of re-centring on the cloud.
+  load(buf, { units = "units", keepView = false } = {}) {
     this.units = units;                       // "m" when a metric scale has been applied
     const { data, count } = parsePLY(buf);
-    this.base = data; this.count = count;
-    this.sorted = new Float32Array(data.length);
-    let cx = 0, cy = 0, cz = 0;
-    for (let i = 0; i < count; i++) { cx += data[i * STRIDE]; cy += data[i * STRIDE + 1]; cz += data[i * STRIDE + 2]; }
-    cx /= count; cy /= count; cz /= count;
-    let r2 = 0;
-    for (let i = 0; i < count; i++) r2 += (data[i * STRIDE] - cx) ** 2 + (data[i * STRIDE + 1] - cy) ** 2 + (data[i * STRIDE + 2] - cz) ** 2;
-    this.target = [cx, cy, cz];
-    this.dist = Math.max(Math.sqrt(r2 / count) * 2.2, 0.5);
-    this.keys = new Uint16Array(count); this.order = new Uint32Array(count); this.zs = new Float32Array(count);
-    this.counts = new Uint32Array(65537);
-    this.lastSort = 0; this.theta = 0;
-    const gl = this.gl;
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.inst);
-    gl.bufferData(gl.ARRAY_BUFFER, this.sorted.byteLength, gl.DYNAMIC_DRAW);
+    this._setData(data, count);
+    if (!keepView && count) {
+      let cx = 0, cy = 0, cz = 0;
+      for (let i = 0; i < count; i++) { cx += data[i * STRIDE]; cy += data[i * STRIDE + 1]; cz += data[i * STRIDE + 2]; }
+      cx /= count; cy /= count; cz /= count;
+      let r2 = 0;
+      for (let i = 0; i < count; i++) r2 += (data[i * STRIDE] - cx) ** 2 + (data[i * STRIDE + 1] - cy) ** 2 + (data[i * STRIDE + 2] - cz) ** 2;
+      this.target = [cx, cy, cz];
+      this.dist = Math.max(Math.sqrt(r2 / count) * 2.2, 0.5);
+      this.theta = 0;
+    }
     return count;
   }
+
+  _setData(data, count) {
+    this.base = data; this.count = count;
+    this.sorted = new Float32Array(data.length);
+    this.keys = new Uint16Array(count); this.order = new Uint32Array(count); this.zs = new Float32Array(count);
+    this.counts = new Uint32Array(65537);
+    this.sel = new Uint8Array(count); this.selCount = 0;
+    this.lastSort = 0;
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.inst);
+    gl.bufferData(gl.ARRAY_BUFFER, Math.max(this.sorted.byteLength, 4), gl.DYNAMIC_DRAW);
+  }
+
+  // ----- selection / deletion -----
+  // poly: [{x, y}] in CSS pixels inside the canvas. mode: "add" | "sub" | "set".
+  // Selects every point (also hidden ones behind others) whose screen position falls inside the polygon,
+  // using the camera of the last drawn frame. Selected points are drawn in orange.
+  selectPoly(poly, mode = "add") {
+    if (!this.count || !this.lastView || poly.length < 3) return this.selCount;
+    const { base, count, sel } = this, v = this.lastView, p = this.lastProj;
+    const W = this.lastW, H = this.lastH, dpr = this.lastDpr, fx = p[0], fy = p[5];
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const q of poly) { x0 = Math.min(x0, q.x); y0 = Math.min(y0, q.y); x1 = Math.max(x1, q.x); y1 = Math.max(y1, q.y); }
+    if (mode === "set") sel.fill(0);
+    const n = poly.length, val = mode === "sub" ? 0 : 1;
+    for (let i = 0; i < count; i++) {
+      const o = i * STRIDE, X = base[o], Y = base[o + 1], Z = base[o + 2];
+      const depth = -(v[2] * X + v[6] * Y + v[10] * Z + v[14]);
+      if (depth < 0.05) continue;
+      const sx = (0.5 + 0.5 * ((fx * (v[0] * X + v[4] * Y + v[8] * Z + v[12])) / depth)) * W / dpr;
+      const sy = (0.5 - 0.5 * ((fy * (v[1] * X + v[5] * Y + v[9] * Z + v[13])) / depth)) * H / dpr;
+      if (sx < x0 || sx > x1 || sy < y0 || sy > y1) continue;
+      let inside = false;
+      for (let a = 0, b = n - 1; a < n; b = a++) {      // even-odd rule
+        const A = poly[a], B = poly[b];
+        if ((A.y > sy) !== (B.y > sy) && sx < ((B.x - A.x) * (sy - A.y)) / (B.y - A.y) + A.x) inside = !inside;
+      }
+      if (inside) sel[i] = val;
+    }
+    let c = 0; for (let i = 0; i < count; i++) c += sel[i];
+    this.selCount = c; this.lastSort = 0;                // force a re-sort so the highlight is uploaded
+    return c;
+  }
+
+  clearSelection() {
+    if (!this.sel) return;
+    this.sel.fill(0); this.selCount = 0; this.lastSort = 0;
+  }
+
+  // Removes the selected points. Returns a copy of the selection mask (indexed like the data before the
+  // removal) so the caller can apply the same removal to its PLY, or null if nothing was selected.
+  deleteSelected() {
+    if (!this.count || !this.selCount) return null;
+    const { base, count, sel } = this, del = sel.slice(), keep = count - this.selCount;
+    const nb = new Float32Array(keep * STRIDE);
+    let j = 0;
+    for (let i = 0; i < count; i++) if (!del[i]) { nb.set(base.subarray(i * STRIDE, (i + 1) * STRIDE), j * STRIDE); j++; }
+    this._setData(nb, keep);
+    return del;
+  }
+
+  zoomBy(f) { this.zoom = Math.max(0.2, Math.min(4, this.zoom * f)); }
 
   _sort(view) {
     const { base, count, zs, keys, counts, order, sorted } = this;
@@ -162,9 +221,11 @@ export class SplatViewer {
     for (let i = 0; i < count; i++) { const q = ((mx - zs[i]) * k) | 0; keys[i] = q; counts[q + 1]++; }
     for (let i = 1; i < counts.length; i++) counts[i] += counts[i - 1];
     for (let i = 0; i < count; i++) order[counts[keys[i]]++] = i;      // nearest first
+    const sel = this.sel;
     for (let j = 0; j < count; j++) {
       const s = order[j] * STRIDE, o = j * STRIDE;
       for (let m = 0; m < STRIDE; m++) sorted[o + m] = base[s + m];
+      if (sel[order[j]]) { sorted[o + 3] = 1; sorted[o + 4] = 0.3; sorted[o + 5] = 0.1; sorted[o + 6] = 1; }
     }
     const gl = this.gl; gl.bindBuffer(gl.ARRAY_BUFFER, this.inst);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0, sorted);
@@ -208,13 +269,15 @@ export class SplatViewer {
   _bindInput() {
     const cv = this.canvas; let drag = null, pinch = null;
     cv.style.touchAction = "none";
-    cv.addEventListener("pointerdown", (e) => { drag = e.clientY; cv.setPointerCapture(e.pointerId); this._setPointer(e); });
+    cv.addEventListener("pointerdown", (e) => { drag = { x: e.clientX, y: e.clientY }; cv.setPointerCapture(e.pointerId); this._setPointer(e); });
     cv.addEventListener("pointerleave", (e) => { if (e.pointerType === "mouse") this.pointer = null; });
     cv.addEventListener("pointerup", () => (drag = null));
     cv.addEventListener("pointermove", (e) => {
       this._setPointer(e);
       if (drag == null) return;
-      this.phi = Math.max(-1.2, Math.min(1.2, this.phi + (e.clientY - drag) * 0.005)); drag = e.clientY;
+      this.phi = Math.max(-1.2, Math.min(1.2, this.phi + (e.clientY - drag.y) * 0.005));
+      this.theta -= (e.clientX - drag.x) * 0.005;           // horizontal drag turns the model too
+      drag = { x: e.clientX, y: e.clientY };
     });
     cv.addEventListener("wheel", (e) => {
       e.preventDefault(); this.zoom = Math.max(0.2, Math.min(4, this.zoom * (e.deltaY > 0 ? 1.08 : 0.92)));
@@ -243,6 +306,7 @@ export class SplatViewer {
       tz + D * Math.cos(this.theta) * Math.cos(this.phi)];
     const view = lookAt(eye, this.target, [0, 1, 0]);
     const proj = perspective((50 * Math.PI) / 180, W / H, 0.05, 200);
+    this.lastView = view; this.lastProj = proj; this.lastW = W; this.lastH = H; this.lastDpr = dpr;
     if (now - this.lastSort > 80) { this._sort(view); this.lastSort = now; }
 
     gl.useProgram(this.pr); gl.bindVertexArray(this.vao);

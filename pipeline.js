@@ -189,6 +189,23 @@ export function buildPLY(img, disp, metric = null) {
   return out.buffer;
 }
 
+// Returns a copy of a binary PLY without the vertices flagged in `del` (Uint8Array, one flag per vertex).
+export function filterPLY(buf, del) {
+  const head = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(buf.byteLength, 4096)));
+  const end = head.indexOf("end_header\n") + 11;
+  const props = head.slice(0, end).split("\n").filter((l) => l.startsWith("property")).length;
+  const rec = props * 4;
+  let keep = 0;
+  for (let i = 0; i < del.length; i++) if (!del[i]) keep++;
+  const hb = new TextEncoder().encode(head.slice(0, end).replace(/element vertex \d+/, "element vertex " + keep));
+  const out = new Uint8Array(hb.length + keep * rec);
+  out.set(hb, 0);
+  const src = new Uint8Array(buf, end);
+  let o = hb.length;
+  for (let i = 0; i < del.length; i++) if (!del[i]) { out.set(src.subarray(i * rec, (i + 1) * rec), o); o += rec; }
+  return out.buffer;
+}
+
 // ---------- Capture -> relative depth (kept in memory so the scale can be re-fitted later) ----------
 export async function estimateDepth(source, sw, sh, onStatus = () => {}) {
   const s = Math.min(1, MAX_SIDE / Math.max(sw, sh)), w = Math.round(sw * s), h = Math.round(sh * s);
