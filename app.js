@@ -1,5 +1,7 @@
 import { SplatViewer } from "./splat.js";
 import { loadModel, estimateDepth, buildPLY, fitMetric, filterPLY } from "./pipeline.js";
+import { parsePLY } from "./splat.js";
+import { poseFromViewer, poseFromLookAt, renderSynthetic, drawGhost, registerView, workingSize } from "./register.js";
 
 const $ = (id) => document.getElementById(id);
 const video = $("cam"), photo = $("photo"), loupe = $("loupe"), statusEl = $("status");
@@ -10,6 +12,7 @@ const cancelScale = $("cancelScale"), cancelPin = $("cancelPin");
 const hoverEl = $("hover"), probeEl = $("probe"), bottom = $("bottom"), vlabel = $("vlabel");
 const app = $("app"), stage = $("stage"), zoomTag = $("zoomTag"), doneBtn = $("doneBtn"), fitBtn = $("fitBtn");
 const selLayer = $("selLayer"), selCanvas = $("selCanvas"), selToggle = $("selToggle"), selShapeBtn = $("selShape");
+const ghostCv = $("ghost"), addViewBtn = $("addView"), ghostCancel = $("ghostCancel"), ghostMode = $("ghostMode"), ghostShoot = $("ghostShoot");
 const selClear = $("selClear"), selDelete = $("selDelete"), selDelLabel = $("selDelLabel"), selUndo = $("selUndo"), vhint = $("vhint");
 const presets = (window.APP_CONFIG && window.APP_CONFIG.REFERENCE_PRESETS) || [];
 const setStatus = (t) => (statusEl.textContent = t);
@@ -22,7 +25,7 @@ const HINT_SELECT = "Drag over the 3D view to select points (adds to the selecti
 // ---------- screen states ----------
 // aim -> busy -> result -> scale <-> pin ; scale -> metric ; metric -> scale (edit) ; any -> aim (retake)
 // Elements marked data-states="..." are shown only in those states; the step bar follows the state.
-const STEP = { aim: 1, busy: 2, result: 2, error: 2, scale: 3, pin: 3, metric: 4 };
+const STEP = { aim: 1, busy: 2, result: 2, error: 2, scale: 3, pin: 3, metric: 4, ghost: 4 };
 const stepEls = [...document.querySelectorAll("#steps li")];
 let state = "aim";
 let metric = null;       // { a, b } once references are applied
@@ -31,6 +34,8 @@ let selMode = false;      // select tool active in the metric view
 let selShape = "box";     // "box" | "lasso"
 let selDrag = null;       // drag in progress: { pts, start, cur, sub }
 const undoStack = [];     // previous PLY buffers, newest last
+let ghost = null;         // add-view state: { pose0, synth, mode }
+let merges = 0;           // camera views merged into the master so far
 function setState(s) {
   state = s; app.dataset.state = s;
   document.querySelectorAll("[data-states]").forEach((el) => { el.hidden = !el.dataset.states.split(" ").includes(s); });
@@ -40,6 +45,7 @@ function setState(s) {
   dl.className = "btn " + (m ? "primary" : "ghost"); dl.style.order = m ? 2 : 1;
   openScale.className = "btn " + (m ? "ghost" : "primary"); openScale.style.order = m ? 1 : 2;
   openLabel.textContent = metric ? "Edit scale" : "";
+  if (s === "metric" && merges > 0) openScale.hidden = true;   // re-scaling would rebuild from the first photo and drop merged views
   backLabel.textContent = s === "result" || s === "error" ? "Retake" : "Back";
   vlabel.textContent = metric ? "3D · metres" : "3D preview";
   if (s !== "metric" && selMode) setSelectMode(false);
@@ -224,7 +230,7 @@ function redraw() {
   } else loupe.hidden = true;
 }
 const schedule = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; redraw(); }); };
-new ResizeObserver(() => { if (frame) { clampView(); redraw(); } }).observe(stage);
+new ResizeObserver(() => { if (frame) { clampView(); redraw(); } paintGhost(); }).observe(stage);
 
 // ---------- pinning mode (zoom/pan state; the layout itself follows the "pin" screen state) ----------
 function setPinMode(on) {
@@ -358,7 +364,7 @@ addRef.addEventListener("click", () => {
 });
 
 function rebuild() {
-  undoStack.length = 0;                            // a rebuild starts again from the full cloud
+  undoStack.length = 0; merges = 0;                            // a rebuild starts again from the full cloud
   lastPly = buildPLY(depth.img, depth.disp, metric);
   return viewer.load(lastPly, { units: metric ? "m" : "units" });
 }
@@ -399,7 +405,7 @@ btn.addEventListener("click", async () => {
 });
 
 function toAim() {
-  undoStack.length = 0;
+  undoStack.length = 0; merges = 0; ghost = null; ghostCv.hidden = true; viewer.spinSpeed = 0.25;
   setPinMode(false);
   showPhoto(false); frame = null; depth = null; metric = null; lastPly = null; pending = null; preview = null;
   refs = []; renderRefs();
@@ -410,6 +416,7 @@ function toAim() {
 retake.addEventListener("click", toAim);
 backBtn.addEventListener("click", () => {
   if (busy) return;
+  if (state === "metric" && merges > 0) { setStatus("Views have been merged. Use Retake to start over, or Download .ply to keep the master."); return; }
   if (state === "metric") { scaleFrom = "result"; renderRefs(); setState("scale"); setStatus(scaleHint()); redraw(); }
   else if (state === "scale") leaveScale();
   else if (state === "result" || state === "error") toAim();
@@ -419,7 +426,7 @@ dl.addEventListener("click", () => {
   if (!lastPly) return;
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([lastPly], { type: "application/octet-stream" }));
-  a.download = metric ? "pointcloud_metric.ply" : "pointcloud.ply"; a.click();
+  a.download = merges ? "master_pointcloud.ply" : metric ? "pointcloud_metric.ply" : "pointcloud.ply"; a.click();
 });
 
 // ---------- trim tool (metric view): select points with a box or lasso, delete, undo ----------
@@ -519,6 +526,75 @@ selUndo.addEventListener("click", () => {
   const n = viewer.load(lastPly, { units: metric ? "m" : "units", keepView: true });
   updateTrim();
   setStatus(`Undone. ${n.toLocaleString()} points.`);
+});
+
+// ---------- add a camera view to the master: ghost overlay -> capture -> register -> merge ----------
+function paintGhost() {
+  if (!ghost || ghostCv.hidden || !video.videoWidth) return;
+  drawGhost(ghostCv, ghost.synth, { mode: ghost.mode, videoW: video.videoWidth, videoH: video.videoHeight });
+}
+function leaveGhost(msg) {
+  ghostCv.hidden = true; ghost = null; viewer.spinSpeed = 0.25;
+  showPhoto(true); setState("metric"); setStatus(msg || MSG_METRIC); redraw();
+}
+addViewBtn.addEventListener("click", () => {
+  if (!lastPly || busy) return;
+  if (!video.videoWidth) { setStatus("The camera is not ready. Allow camera access (HTTPS) and try again."); return; }
+  viewer.spinSpeed = 0;                                   // freeze the view, then read its pose in the same tick
+  const vp = poseFromViewer(viewer), tgt = viewer.target;
+  const { w, h } = workingSize(video.videoWidth, video.videoHeight);
+  const master = parsePLY(lastPly);
+  // The viewer is usually zoomed out, so the master can be a small part of a phone frame. Keep the viewing direction and
+  // move the camera towards the target until the master fills the frame (the user stands that far from the object).
+  let pose0 = vp, synth = renderSynthetic(master, vp, w, h);
+  for (const f of [0.8, 0.65, 0.5, 0.4, 0.3, 0.22]) {
+    if (synth.coverage >= 0.45) break;
+    const p = poseFromLookAt([tgt[0] + f * (vp.t[0] - tgt[0]), tgt[1] + f * (vp.t[1] - tgt[1]), tgt[2] + f * (vp.t[2] - tgt[2])], tgt);
+    const s = renderSynthetic(master, p, w, h);
+    if (s.coverage > synth.coverage) { pose0 = p; synth = s; }
+  }
+  if (synth.coverage < 0.25) {
+    viewer.spinSpeed = 0.25;
+    setStatus(`The master covers only ${(synth.coverage * 100).toFixed(0)}% of this angle. Orbit to a view that shows more of it, then tap Add view.`);
+    return;
+  }
+  const standoff = Math.hypot(pose0.t[0] - tgt[0], pose0.t[1] - tgt[1], pose0.t[2] - tgt[2]);
+  ghost = { pose0, synth, mode: "edges" };
+  if (selMode) setSelectMode(false);
+  showPhoto(false); setState("ghost"); ghostCv.hidden = false; ghostMode.textContent = "Ghost: edges";
+  requestAnimationFrame(paintGhost);
+  setStatus(`Line the camera up with the cyan outline, about ${standoff.toFixed(1)} m from the middle of the object (${(synth.coverage * 100).toFixed(0)}% of the frame is covered). Keep the scene still, then Capture.`);
+});
+ghostMode.addEventListener("click", () => {
+  if (!ghost) return;
+  ghost.mode = ghost.mode === "edges" ? "image" : "edges";
+  ghostMode.textContent = "Ghost: " + ghost.mode; paintGhost();
+});
+ghostCancel.addEventListener("click", () => { if (!busy) leaveGhost(); });
+ghostShoot.addEventListener("click", async () => {
+  if (!ghost || busy || !video.videoWidth) return;
+  busy = true; ghostShoot.disabled = true; ghostCancel.disabled = true;
+  try {
+    const f = document.createElement("canvas");           // local frame: leaves `frame` / `depth` of the first photo alone
+    f.width = video.videoWidth; f.height = video.videoHeight;
+    f.getContext("2d").drawImage(video, 0, 0);
+    setStatus("Estimating depth…");
+    const vd = await estimateDepth(f, f.width, f.height, setStatus);
+    setStatus("Registering to the master…");
+    await new Promise((r) => setTimeout(r, 30));          // let the status paint before the heavy loop
+    const r = registerView(lastPly, vd, ghost.pose0, (window.APP_CONFIG && window.APP_CONFIG.REGISTER) || {});
+    if (!r.ok) { setStatus("Not merged: " + r.reason + "."); return; }     // stay on the ghost so the user can retry
+    undoStack.push(lastPly); if (undoStack.length > 10) undoStack.shift();
+    lastPly = r.merged; merges++;
+    viewer.load(lastPly, { units: "m", keepView: true });
+    leaveGhost(`Merged: +${r.added.toLocaleString()} new points (${r.same.toLocaleString()} already in the master). ` +
+      `Residual ${(r.icp.rmse * 1000).toFixed(1)} mm. Undo reverts this view.`);
+    updateTrim();
+  } catch (e) {
+    console.error(e); setStatus("Error: " + e.message);
+  } finally {
+    busy = false; ghostShoot.disabled = false; ghostCancel.disabled = false;
+  }
 });
 
 renderRefs();

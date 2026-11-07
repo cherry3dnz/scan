@@ -126,6 +126,11 @@
   .row2 .btn.primary { flex:1.5; }
 
   /* pinning overlays */
+  /* ghost overlay (add-view state): outline of the master drawn over the live camera */
+  #ghost { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:2; }
+  #app[data-state=ghost] #dock { gap:8px; }
+  #app[data-state=ghost] #dock .btn { padding:0 10px; font-size:14px; }
+
   #loupe { position:absolute; top:10px; right:10px; width:180px; height:180px; border:2px solid #fff;
            border-radius:10px; background:#000; pointer-events:none; z-index:3; }
   #zoomTag { position:absolute; left:12px; bottom:20px; padding:2px 8px; font:12px ui-monospace, Menlo, Consolas, monospace;
@@ -143,7 +148,7 @@
 <body>
 <main id="app" data-state="aim">
 
-  <header id="bar" data-states="aim busy result scale metric error">
+  <header id="bar" data-states="aim busy result scale metric error ghost">
     <div class="left">
       <button id="back" class="textbtn" data-states="result scale metric error" aria-label="Back" hidden>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
@@ -157,7 +162,7 @@
     </button>
   </header>
 
-  <ol id="steps" data-states="aim busy result scale metric error">
+  <ol id="steps" data-states="aim busy result scale metric error ghost">
     <li>1 Capture</li>
     <li>2 Preview</li>
     <li>3 Scale</li>
@@ -170,6 +175,7 @@
     <div id="stage">
       <video id="cam" autoplay playsinline muted></video>
       <canvas id="photo" hidden></canvas>
+      <canvas id="ghost" hidden aria-hidden="true"></canvas>
       <div id="guide" data-states="aim" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
       <span class="tag" data-states="result scale metric" hidden>Photo</span>
       <canvas id="loupe" width="360" height="360" hidden></canvas>
@@ -198,6 +204,10 @@
         <button id="selDelete" class="tb danger" disabled hidden>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>
           <span id="selDelLabel">Delete</span>
+        </button>
+        <button id="addView" class="tb" title="Add a view from the current 3D angle">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+          Add view
         </button>
         <button id="selUndo" class="tb" title="Undo delete" aria-label="Undo delete" disabled>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg>
@@ -237,7 +247,7 @@
     </div>
   </div>
 
-  <footer id="dock" data-states="aim busy result pin metric">
+  <footer id="dock" data-states="aim busy result pin metric ghost">
     <button id="capture" aria-label="Capture photo" data-states="aim" disabled><span></span></button>
     <button id="working" class="btn primary" data-states="busy" disabled hidden>Working…</button>
     <button id="download" class="btn ghost" data-states="result metric" hidden>
@@ -247,6 +257,12 @@
     <button id="openScale" class="btn primary" data-states="result metric" hidden>
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 17L17 3l4 4L7 21z"/><path d="M7 13l2 2M10 10l2 2M13 7l2 2"/></svg>
       <span id="openLabel">Add real-world scale</span>
+    </button>
+    <button id="ghostCancel" class="btn ghost" data-states="ghost" hidden>Cancel</button>
+    <button id="ghostMode" class="btn ghost" data-states="ghost" hidden>Ghost: edges</button>
+    <button id="ghostShoot" class="btn primary" data-states="ghost" hidden>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+      Capture
     </button>
     <button id="cancelPin" class="btn ghost" data-states="pin" hidden>Cancel</button>
     <button id="doneBtn" class="btn primary" data-states="pin" hidden>

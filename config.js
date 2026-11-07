@@ -8,6 +8,8 @@ window.APP_CONFIG = {
   // Optional lens calibration from tools/calibrate.py (paste the printed block here), e.g.
   // CALIBRATION: { width:1280, height:720, fx:1000, fy:1000, cx:640, cy:360, k1:-0.1, k2:0.01, p1:0, p2:0, k3:0 }
   CALIBRATION: null,
+  // Optional overrides for the add-view registration (see DEFAULTS in register.js), e.g. { maxIcpRmse: 0.04, voxel: 0.015 }
+  REGISTER: {},
   // Reference objects offered in the metric-scale panel. mm: null = the user types the length.
   // Check coin sizes against your own coin; the numbers below are typical values.
   REFERENCE_PRESETS: [
