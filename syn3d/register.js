@@ -2,7 +2,7 @@
 // Pipeline: ghost render of master (guide) -> depth fit to master -> coarse-to-fine rigid ICP -> depth-buffer merge.
 // Conventions (same as pipeline.js): metres, camera looks down -Z, X right, Y up.
 // A pose is camera-to-world: { R: [9 numbers, row-major], t: [x, y, z] }  =>  p_master = R * p_cam + t
-import { intrinsics, normParams } from "./pipeline.js";
+import { intrinsics, normParams, resizeBilinear } from "./pipeline.js";
 import { parsePLY } from "./splat.js";
 
 const CFG = globalThis.APP_CONFIG || {};
@@ -12,6 +12,7 @@ const SH_C0 = 0.28209479177387814;
 const REC = 17;                          // floats per vertex in the PLY written by buildPLY
 
 export const DEFAULTS = {
+  autoAlign: true,                       // search for the pose that best matches the photo depth before ICP
   pointStride: 2,                        // sampling of the new depth map (pixels)
   rounds: 2,                             // fit -> ICP rounds
   minCoverage: 0.25,                     // fraction of the frame the master must cover at the guess pose
@@ -303,13 +304,95 @@ export function mergeInto(masterBuf, master, np, pose, w, h, o = DEFAULTS) {
   return { buf: st.added ? appendPLY(masterBuf, rec, st.added) : masterBuf, ...st };
 }
 
+
+// ---------- Pose nudging and automatic alignment ----------
+// A "nudge" is expressed in the camera frame: rotation vector (rx, ry, rz rad) and translation (tx, ty, tz m).
+function rotAxis(ax, ay, az) {
+  const a = Math.hypot(ax, ay, az); if (a < 1e-12) return [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  const x = ax / a, y = ay / a, z = az / a, c = Math.cos(a), s = Math.sin(a), C = 1 - c;
+  return [c + x * x * C, x * y * C - z * s, x * z * C + y * s, y * x * C + z * s, c + y * y * C, y * z * C - x * s, z * x * C - y * s, z * y * C + x * s, c + z * z * C];
+}
+export function nudgePose(pose, d) {
+  const R = mulRR(pose.R, rotAxis(d.rx || 0, d.ry || 0, d.rz || 0)), tv = mulRV(pose.R, [d.tx || 0, d.ty || 0, d.tz || 0]);
+  return { R, t: [pose.t[0] + tv[0], pose.t[1] + tv[1], pose.t[2] + tv[2]] };
+}
+export function medianDepth(synth) {
+  const v = []; for (let p = 0; p < synth.depth.length; p += 7) if (synth.depth[p] > 0) v.push(synth.depth[p]);
+  v.sort((a, b) => a - b); return v.length ? v[v.length >> 1] : 1;
+}
+// Every k-th splat, with the footprint grown so the render stays dense. For fast previews and the alignment search.
+export function subsampleMaster(master, maxPts) {
+  const k = Math.max(1, Math.floor(master.count / maxPts)), n = Math.floor(master.count / k), d = new Float32Array(n * STRIDE);
+  for (let i = 0; i < n; i++) {
+    d.set(master.data.subarray(i * k * STRIDE, (i * k + 1) * STRIDE), i * STRIDE);
+    d[i * STRIDE + 7] *= k; d[i * STRIDE + 10] *= k; d[i * STRIDE + 12] *= k;
+  }
+  return { data: d, count: n };
+}
+function blur3(a, w, h) {
+  const o = new Float32Array(a.length);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0, n = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const xx = x + dx, yy = y + dy; if (xx >= 0 && yy >= 0 && xx < w && yy < h) { s += a[yy * w + xx]; n++; } }
+    o[y * w + x] = s / n;
+  }
+  return o;
+}
+// Finds the camera pose near pose0 whose rendered inverse depth best correlates with the photo's relative depth.
+// Pearson correlation is unchanged by the unknown affine scale of monocular depth (1/Z = a*d + b), so no scale is needed.
+// 6-DoF pattern search, coarse to fine, on a 128 px render. Returns { ok, pose, before, after } (correlations).
+export function autoAlign(master, view, pose0, opts = {}) {
+  const { disp, w, h } = view, lw = opts.lowW || 128, lh = Math.max(16, Math.round((h * lw) / w));
+  if (master.count < 500) return { ok: false, reason: "master too small" };
+  let dl = resizeBilinear(disp, w, h, lw, lh); dl = blur3(blur3(dl, lw, lh), lw, lh);
+  const mini = subsampleMaster(master, 30000);
+  let n0 = 0;
+  const score = (pose) => {
+    const s = renderSynthetic(mini, pose, lw, lh);
+    let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    for (let p = 0; p < lw * lh; p++) {
+      const d = s.depth[p]; if (!(d > 0)) continue;
+      const x = 1 / d, y = dl[p]; n++; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+    }
+    if (n < 150) return { sc: -1, r: -1, n, s };
+    const den = Math.sqrt(Math.max(n * sxx - sx * sx, 1e-12) * Math.max(n * syy - sy * sy, 1e-12)), r = (n * sxy - sx * sy) / den;
+    return { sc: r * Math.sqrt(Math.min(1, n / (0.8 * (n0 || n)))), r, n, s };   // penalise sliding off the master
+  };
+  const first = score(pose0); n0 = first.n;
+  if (first.sc < 0) return { ok: false, reason: "no overlap at the starting pose" };
+  const z = medianDepth(first.s);
+  let best = first.sc, delta = [0, 0, 0, 0, 0, 0], rs = opts.alignRot || 0.06, ts = (opts.alignTrans || 0.07) * z;
+  const maxR = 0.3, maxT = 0.4 * z, mk = (d) => nudgePose(pose0, { rx: d[0], ry: d[1], rz: d[2], tx: d[3], ty: d[4], tz: d[5] });
+  // search directions: 3 camera rotations, 3 camera translations, and 2 orbit moves (rotate and slide together so the
+  // object stays put in the image). Orbits follow the valley where depth correlation barely changes.
+  const dirs = (rs, ts) => [[rs, 0, 0, 0, 0, 0], [0, rs, 0, 0, 0, 0], [0, 0, rs, 0, 0, 0], [0, 0, 0, ts, 0, 0], [0, 0, 0, 0, ts, 0], [0, 0, 0, 0, 0, ts],
+    [0, rs, 0, z * rs, 0, 0], [rs, 0, 0, 0, -z * rs, 0]];
+  while (rs > 0.004) {
+    for (let pass = 0; pass < 10; pass++) {
+      let improved = false;
+      for (const v of dirs(rs, ts)) for (const sg of [1, -1]) {
+        const dd = delta.map((q, i) => q + sg * v[i]);
+        if (Math.hypot(dd[0], dd[1], dd[2]) > maxR || Math.hypot(dd[3], dd[4], dd[5]) > maxT) continue;
+        const c = score(mk(dd));
+        if (c.sc > best + 1e-4) { best = c.sc; delta = dd; improved = true; }
+      }
+      if (!improved) break;
+    }
+    rs /= 2; ts /= 2;
+  }
+  const fin = score(mk(delta));
+  if (fin.r < first.r + 0.01) return { ok: false, reason: "no better alignment found", before: first.r, after: first.r };
+  return { ok: true, pose: mk(delta), before: first.r, after: fin.r, delta };
+}
+
 // ---------- Orchestrator ----------
 // masterBuf: master PLY (ArrayBuffer). view: result of estimateDepth() for the new photo { img, disp, w, h }.
 // pose0: pose the ghost was rendered from (poseFromViewer at capture time).
 export function registerView(masterBuf, view, pose0, opts = {}) {
   const o = { ...DEFAULTS, ...opts }, { img, disp, w, h } = view, master = parsePLY(masterBuf);
   const fail = (reason, extra = {}) => ({ ok: false, reason, ...extra });
-  let pose = pose0, fit = null, ic = null;
+  let pose = pose0, fit = null, ic = null, align = null;
+  if (o.autoAlign) { align = autoAlign(master, view, pose0, o); if (align.ok) pose = align.pose; }
   for (let round = 0; round < o.rounds; round++) {
     const synth = renderSynthetic(master, pose, w, h);
     if (round === 0 && synth.coverage < o.minCoverage)
@@ -338,5 +421,5 @@ export function registerView(masterBuf, view, pose0, opts = {}) {
     return fail(`could not register the view (match ${(ic.frac * 100).toFixed(0)}%, residual ${(ic.rmse * 1000).toFixed(0)} mm) - retake closer to the ghost`, { fit, icp: ic });
   const np = newPointsFromDepth(img, disp, w, h, fit, o);       // final points: last fit, final pose
   const m = mergeInto(masterBuf, master, np, pose, w, h, o);
-  return { ok: true, merged: m.buf, pose, fit, icp: { rmse: ic.rmse, frac: ic.frac }, added: m.added, same: m.same, behind: m.behind, front: m.front, none: m.none, candidates: np.n };
+  return { ok: true, merged: m.buf, pose, fit, icp: { rmse: ic.rmse, frac: ic.frac }, added: m.added, same: m.same, behind: m.behind, front: m.front, none: m.none, candidates: np.n, align };
 }

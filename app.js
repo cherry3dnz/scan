@@ -1,7 +1,7 @@
 import { SplatViewer } from "./splat.js";
-import { loadModel, estimateDepth, buildPLY, fitMetric, filterPLY } from "./pipeline.js";
+import { loadModel, estimateDepth, buildPLY, fitMetric, filterPLY, intrinsics } from "./pipeline.js";
 import { parsePLY } from "./splat.js";
-import { poseFromViewer, poseFromLookAt, renderSynthetic, drawGhost, registerView, workingSize } from "./register.js";
+import { poseFromViewer, poseFromLookAt, renderSynthetic, drawGhost, registerView, workingSize, nudgePose, medianDepth, subsampleMaster, autoAlign } from "./register.js";
 
 const $ = (id) => document.getElementById(id);
 const video = $("cam"), photo = $("photo"), loupe = $("loupe"), statusEl = $("status");
@@ -13,6 +13,7 @@ const hoverEl = $("hover"), probeEl = $("probe"), bottom = $("bottom"), vlabel =
 const app = $("app"), stage = $("stage"), zoomTag = $("zoomTag"), doneBtn = $("doneBtn"), fitBtn = $("fitBtn");
 const selLayer = $("selLayer"), selCanvas = $("selCanvas"), selToggle = $("selToggle"), selShapeBtn = $("selShape");
 const ghostCv = $("ghost"), addViewBtn = $("addView"), ghostCancel = $("ghostCancel"), ghostMode = $("ghostMode"), ghostShoot = $("ghostShoot");
+const alignRetake = $("alignRetake"), alignAuto = $("alignAuto"), alignMerge = $("alignMerge");
 const selClear = $("selClear"), selDelete = $("selDelete"), selDelLabel = $("selDelLabel"), selUndo = $("selUndo"), vhint = $("vhint");
 const presets = (window.APP_CONFIG && window.APP_CONFIG.REFERENCE_PRESETS) || [];
 const setStatus = (t) => (statusEl.textContent = t);
@@ -25,7 +26,7 @@ const HINT_SELECT = "Drag over the 3D view to select points (adds to the selecti
 // ---------- screen states ----------
 // aim -> busy -> result -> scale <-> pin ; scale -> metric ; metric -> scale (edit) ; any -> aim (retake)
 // Elements marked data-states="..." are shown only in those states; the step bar follows the state.
-const STEP = { aim: 1, busy: 2, result: 2, error: 2, scale: 3, pin: 3, metric: 4, ghost: 4 };
+const STEP = { aim: 1, busy: 2, result: 2, error: 2, scale: 3, pin: 3, metric: 4, ghost: 4, align: 4 };
 const stepEls = [...document.querySelectorAll("#steps li")];
 let state = "aim";
 let metric = null;       // { a, b } once references are applied
@@ -86,9 +87,11 @@ setState("aim");
 
 // ---------- camera + model ----------
 async function startCamera() {
+  const portrait = window.innerHeight > window.innerWidth;
   try {
     video.srcObject = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+      // Ask for a stream shaped like the screen (portrait on a phone) so the camera fills the window instead of a letterboxed strip.
+      video: { facingMode: { ideal: "environment" }, width: { ideal: portrait ? 720 : 1280 }, height: { ideal: portrait ? 1280 : 720 } }, audio: false });
     await video.play();
     btn.disabled = false;
     if (state === "aim") setStatus(modelMsg || HINT_AIM);
@@ -528,15 +531,29 @@ selUndo.addEventListener("click", () => {
   setStatus(`Undone. ${n.toLocaleString()} points.`);
 });
 
-// ---------- add a camera view to the master: ghost overlay -> capture -> register -> merge ----------
+// ---------- add a camera view to the master ----------
+// ghost (live outline as a framing guide) -> Capture (freezes the frame, estimates depth) -> align (automatic search, then
+// drag / pinch to nudge the outline onto the photo) -> Merge. A failed merge keeps you on the align screen: nudge and retry
+// without taking the photo or running the depth model again.
+const REG = () => (window.APP_CONFIG && window.APP_CONFIG.REGISTER) || {};
 function paintGhost() {
   if (!ghost || ghostCv.hidden || !video.videoWidth) return;
   drawGhost(ghostCv, ghost.synth, { mode: ghost.mode, videoW: video.videoWidth, videoH: video.videoHeight });
 }
+function renderGhost(fast) {                                 // fast = half-resolution preview from a thinned master while dragging
+  if (!ghost) return;
+  const { w, h } = workingSize(video.videoWidth, video.videoHeight), rw = fast ? Math.round(w / 2) : w, rh = Math.round((h * rw) / w);
+  ghost.synth = renderSynthetic(fast ? ghost.mini : ghost.master, ghost.pose, rw, rh);
+  ghost.z = medianDepth(ghost.synth);
+  paintGhost();
+}
 function leaveGhost(msg) {
-  ghostCv.hidden = true; ghost = null; viewer.spinSpeed = 0.25;
+  ghostCv.hidden = true; ghost = null; viewer.spinSpeed = 0.25; video.play().catch(() => {});
   showPhoto(true); setState("metric"); setStatus(msg || MSG_METRIC); redraw();
 }
+const tick = () => new Promise((r) => setTimeout(r, 30));      // let the status text paint before a heavy loop
+function setAlignBusy(on) { alignRetake.disabled = alignAuto.disabled = alignMerge.disabled = on; }
+
 addViewBtn.addEventListener("click", () => {
   if (!lastPly || busy) return;
   if (!video.videoWidth) { setStatus("The camera is not ready. Allow camera access (HTTPS) and try again."); return; }
@@ -559,11 +576,12 @@ addViewBtn.addEventListener("click", () => {
     return;
   }
   const standoff = Math.hypot(pose0.t[0] - tgt[0], pose0.t[1] - tgt[1], pose0.t[2] - tgt[2]);
-  ghost = { pose0, synth, mode: "edges" };
+  ghost = { pose0, pose: pose0, synth, master, mini: subsampleMaster(master, 25000), mode: "edges", vd: null, z: medianDepth(synth) };
   if (selMode) setSelectMode(false);
+  video.play().catch(() => {});
   showPhoto(false); setState("ghost"); ghostCv.hidden = false; ghostMode.textContent = "Ghost: edges";
   requestAnimationFrame(paintGhost);
-  setStatus(`Line the camera up with the cyan outline, about ${standoff.toFixed(1)} m from the middle of the object (${(synth.coverage * 100).toFixed(0)}% of the frame is covered). Keep the scene still, then Capture.`);
+  setStatus(`Roughly line the camera up with the cyan outline, about ${standoff.toFixed(1)} m from the middle of the object. It does not need to be exact: you can fine-tune after capturing.`);
 });
 ghostMode.addEventListener("click", () => {
   if (!ghost) return;
@@ -571,19 +589,54 @@ ghostMode.addEventListener("click", () => {
   ghostMode.textContent = "Ghost: " + ghost.mode; paintGhost();
 });
 ghostCancel.addEventListener("click", () => { if (!busy) leaveGhost(); });
-ghostShoot.addEventListener("click", async () => {
+
+async function runAutoAlign() {
+  setStatus("Aligning the outline to the photo…"); await tick();
+  const t0 = performance.now(), res = autoAlign(ghost.master, ghost.vd, ghost.pose);
+  if (res.ok) {
+    ghost.pose = res.pose; renderGhost(false);
+    setStatus(`Aligned (match ${res.before.toFixed(2)} → ${res.after.toFixed(2)}, ${Math.round(performance.now() - t0)} ms). If the outline is still off, drag it onto the photo, then Merge.`);
+  } else {
+    setStatus(`Auto-align: ${res.reason}. Drag the outline onto the photo, then Merge.`);
+  }
+}
+ghostShoot.addEventListener("click", async () => {                // Capture: freeze the frame
   if (!ghost || busy || !video.videoWidth) return;
-  busy = true; ghostShoot.disabled = true; ghostCancel.disabled = true;
+  busy = true; ghostShoot.disabled = ghostCancel.disabled = true;
+  const f = document.createElement("canvas");                     // local frame: leaves `frame` / `depth` of the first photo alone
+  f.width = video.videoWidth; f.height = video.videoHeight;
+  f.getContext("2d").drawImage(video, 0, 0);
+  video.pause();                                                  // the paused video stays on screen as the photo
+  setState("align"); setAlignBusy(true);
   try {
-    const f = document.createElement("canvas");           // local frame: leaves `frame` / `depth` of the first photo alone
-    f.width = video.videoWidth; f.height = video.videoHeight;
-    f.getContext("2d").drawImage(video, 0, 0);
     setStatus("Estimating depth…");
-    const vd = await estimateDepth(f, f.width, f.height, setStatus);
-    setStatus("Registering to the master…");
-    await new Promise((r) => setTimeout(r, 30));          // let the status paint before the heavy loop
-    const r = registerView(lastPly, vd, ghost.pose0, (window.APP_CONFIG && window.APP_CONFIG.REGISTER) || {});
-    if (!r.ok) { setStatus("Not merged: " + r.reason + "."); return; }     // stay on the ghost so the user can retry
+    ghost.vd = await estimateDepth(f, f.width, f.height, setStatus);
+    await runAutoAlign();
+  } catch (e) {
+    console.error(e); setStatus("Error: " + e.message);
+    video.play().catch(() => {}); setState("ghost"); ghost.vd = null;
+  } finally {
+    busy = false; setAlignBusy(false); ghostShoot.disabled = ghostCancel.disabled = false;
+  }
+});
+alignRetake.addEventListener("click", () => {
+  if (!ghost || busy) return;
+  ghost.vd = null; video.play().catch(() => {});
+  setState("ghost"); renderGhost(false);
+  setStatus("Line the camera up with the outline again, then Capture.");
+});
+alignAuto.addEventListener("click", async () => {
+  if (!ghost || !ghost.vd || busy) return;
+  busy = true; setAlignBusy(true);
+  try { await runAutoAlign(); } finally { busy = false; setAlignBusy(false); }
+});
+alignMerge.addEventListener("click", async () => {
+  if (!ghost || !ghost.vd || busy) return;
+  busy = true; setAlignBusy(true);
+  try {
+    setStatus("Registering to the master…"); await tick();
+    const r = registerView(lastPly, ghost.vd, ghost.pose, { ...REG(), autoAlign: false });   // keep the pose the user sees
+    if (!r.ok) { setStatus("Not merged: " + r.reason + ". Nudge the outline or press Auto-align, then Merge again."); return; }
     undoStack.push(lastPly); if (undoStack.length > 10) undoStack.shift();
     lastPly = r.merged; merges++;
     viewer.load(lastPly, { units: "m", keepView: true });
@@ -593,9 +646,61 @@ ghostShoot.addEventListener("click", async () => {
   } catch (e) {
     console.error(e); setStatus("Error: " + e.message);
   } finally {
-    busy = false; ghostShoot.disabled = false; ghostCancel.disabled = false;
+    busy = false; setAlignBusy(false);
   }
 });
+
+// Nudging the outline on the frozen photo. The outline follows your finger:
+//   one finger / left mouse drag = turn the camera (the outline slides)       mouse wheel / two-finger pinch = move forward or back
+//   two-finger drag / Shift+drag = move the camera sideways                   two-finger twist / right-mouse drag = roll
+const gptrs = new Map(); let gprev = null, graf = 0;
+const gpts = () => [...gptrs.values()];
+const gstate = () => {
+  const p = gpts(); if (p.length < 2) return null;
+  return { cx: (p[0].x + p[1].x) / 2, cy: (p[0].y + p[1].y) / 2, d: Math.max(Math.hypot(p[1].x - p[0].x, p[1].y - p[0].y), 1), a: Math.atan2(p[1].y - p[0].y, p[1].x - p[0].x) };
+};
+function gnudge(c) {                                          // c: { dx, dy (css px), turn|shift, ratio, roll (rad) }
+  if (!ghost || !video.videoWidth) return;
+  const vw = video.videoWidth, vh = video.videoHeight, { w, h } = workingSize(vw, vh), K = intrinsics(w, h);
+  const k = (Math.min(ghostCv.clientWidth / vw, ghostCv.clientHeight / vh) * vw) / w, z = ghost.z || 1;   // css px per working px
+  const dx = (c.dx || 0) / k, dy = (c.dy || 0) / k, d = {};
+  if (c.mode === "shift") { d.tx = (-dx * z) / K.fx; d.ty = (dy * z) / K.fy; } else { d.ry = dx / K.fx; d.rx = dy / K.fy; }
+  if (c.ratio) d.tz = -z * (1 - 1 / c.ratio);
+  if (c.roll) d.rz = c.roll;
+  ghost.pose = nudgePose(ghost.pose, d);
+  if (!graf) graf = requestAnimationFrame(() => { graf = 0; renderGhost(true); });
+}
+ghostCv.addEventListener("pointerdown", (e) => {
+  if (state !== "align" || busy || gptrs.size >= 2) return;
+  e.preventDefault(); ghostCv.setPointerCapture(e.pointerId);
+  gptrs.set(e.pointerId, { x: e.clientX, y: e.clientY, btn: e.buttons, shift: e.shiftKey, mouse: e.pointerType === "mouse" });
+  gprev = gstate();
+});
+ghostCv.addEventListener("pointermove", (e) => {
+  const q = gptrs.get(e.pointerId); if (!q || state !== "align") return;
+  const dx = e.clientX - q.x, dy = e.clientY - q.y; q.x = e.clientX; q.y = e.clientY; q.shift = e.shiftKey;
+  if (gptrs.size === 1) {
+    if (q.mouse && (q.btn & 2)) gnudge({ roll: dx * 0.004 });
+    else gnudge({ dx, dy, mode: q.shift ? "shift" : "turn" });
+  } else {
+    const s = gstate();
+    if (gprev && s) gnudge({ dx: s.cx - gprev.cx, dy: s.cy - gprev.cy, mode: "shift", ratio: s.d / gprev.d, roll: s.a - gprev.a });
+    gprev = s;
+  }
+});
+function gend(e) {
+  if (!gptrs.delete(e.pointerId)) return;
+  gprev = gstate();
+  if (!gptrs.size) { if (graf) { cancelAnimationFrame(graf); graf = 0; } renderGhost(false); }   // sharp render when the gesture ends
+}
+ghostCv.addEventListener("pointerup", gend);
+ghostCv.addEventListener("pointercancel", gend);
+ghostCv.addEventListener("contextmenu", (e) => e.preventDefault());
+ghostCv.addEventListener("wheel", (e) => {
+  if (state !== "align" || busy) return;
+  e.preventDefault(); gnudge({ ratio: Math.exp(-e.deltaY * 0.0015) });
+  clearTimeout(ghostCv._t); ghostCv._t = setTimeout(() => renderGhost(false), 150);
+}, { passive: false });
 
 renderRefs();
 startCamera();
