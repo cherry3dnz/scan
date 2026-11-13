@@ -142,8 +142,15 @@
   /* pinning overlays */
   /* ghost overlay (add-view state): outline of the master drawn over the live camera */
   #ghost { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:2; }
-  #app[data-state=ghost] #dock { gap:8px; }
-  #app[data-state=ghost] #dock .btn { padding:0 10px; font-size:14px; }
+  #app[data-state=ghost] #dock, #app[data-state=align] #dock, #app[data-state=review] #dock { gap:8px; }
+  #app[data-state=ghost] #dock .btn, #app[data-state=align] #dock .btn, #app[data-state=review] #dock .btn { padding:0 10px; font-size:14px; }
+
+  /* capture review: two stacked 3D panels (master on top, new view below) */
+  #review { flex:1 1 0; min-height:0; display:flex; flex-direction:column; gap:10px; }
+  #app[data-state=review] #stage { display:none; }
+  .panel { position:relative; flex:1 1 0; min-height:0; border-radius:14px; overflow:hidden; border:1px solid var(--line); background:#0a0b0e; }
+  .panel canvas { width:100%; height:100%; display:block; }
+  #app[data-state=review] #dock .btn.primary { flex:2; }
 
   #loupe { position:absolute; top:10px; right:10px; width:180px; height:180px; border:2px solid #fff;
            border-radius:10px; background:#000; pointer-events:none; z-index:3; }
@@ -162,7 +169,7 @@
 <body>
 <main id="app" data-state="aim">
 
-  <header id="bar" data-states="aim busy result scale metric error ghost align">
+  <header id="bar" data-states="aim busy result scale metric error ghost align review">
     <div class="left">
       <button id="back" class="textbtn" data-states="result scale metric error" aria-label="Back" hidden>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
@@ -176,7 +183,7 @@
     </button>
   </header>
 
-  <ol id="steps" data-states="aim busy result scale metric error ghost align">
+  <ol id="steps" data-states="aim busy result scale metric error ghost review">
     <li>1 Capture</li>
     <li>2 Preview</li>
     <li>3 Scale</li>
@@ -197,6 +204,17 @@
       <button id="fitBtn" aria-label="Fit photo to screen" title="Reset zoom" hidden>
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
       </button>
+    </div>
+
+    <div id="review" data-states="review" hidden>
+      <section class="panel">
+        <canvas id="revTopCv"></canvas>
+        <span class="tag" id="revTopTag">Master</span>
+      </section>
+      <section class="panel">
+        <canvas id="revBotCv"></canvas>
+        <span class="tag" id="revBotTag">New view</span>
+      </section>
     </div>
 
     <section id="bottom">
@@ -261,7 +279,7 @@
     </div>
   </div>
 
-  <footer id="dock" data-states="aim busy result pin metric ghost align">
+  <footer id="dock" data-states="aim busy result pin metric ghost align review">
     <button id="capture" aria-label="Capture photo" data-states="aim" disabled><span></span></button>
     <button id="working" class="btn primary" data-states="busy" disabled hidden>Working…</button>
     <button id="download" class="btn ghost" data-states="result metric" hidden>
@@ -280,6 +298,13 @@
     </button>
     <button id="alignRetake" class="btn ghost" data-states="align" hidden>Retake</button>
     <button id="alignAuto" class="btn ghost" data-states="align" hidden>Auto-align</button>
+    <button id="alignReview" class="btn ghost" data-states="align" hidden>Compare</button>
+    <button id="reviewRetake" class="btn ghost" data-states="review" hidden>Retake</button>
+    <button id="reviewAdjust" class="btn ghost" data-states="review" hidden>Adjust</button>
+    <button id="reviewMerge" class="btn primary" data-states="review" hidden>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>
+      Merge two point clouds
+    </button>
     <button id="alignMerge" class="btn primary" data-states="align" hidden>
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>
       Merge
