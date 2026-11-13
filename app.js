@@ -557,9 +557,11 @@ function leaveGhost(msg) {
   showPhoto(true); setState("metric"); setStatus(msg || MSG_METRIC); redraw();
 }
 const tick = () => new Promise((r) => setTimeout(r, 30));      // let the status text paint before a heavy loop
+const reviewDl = $("reviewDownload");
+let reviewPly = null;                                          // { master, newView, scaled } buffers behind the two review panels
 function setAlignBusy(on) {
   alignRetake.disabled = alignAuto.disabled = alignMerge.disabled = alignReview.disabled = on;
-  reviewAdjust.disabled = reviewRetake.disabled = reviewMerge.disabled = on;
+  reviewAdjust.disabled = reviewRetake.disabled = reviewMerge.disabled = reviewDl.disabled = on;
 }
 
 // ---------- capture review: master (top) and the new view's point cloud (bottom) ----------
@@ -571,8 +573,23 @@ function ensureReviewViewers() {
   revBot = new SplatViewer($("revBotCv"), { spinSpeed: 0 });
 }
 function clearReview() {
+  reviewPly = null;
   for (const v of [revTop, revBot]) if (v && v.count) v._setData(new Float32Array(0), 0);   // stop drawing while hidden
 }
+// Saves both review clouds as separate .ply files (staggered, because browsers may block simultaneous downloads).
+function saveBuffer(buf, name) {
+  const a = document.createElement("a"), url = URL.createObjectURL(new Blob([buf], { type: "application/octet-stream" }));
+  a.href = url; a.download = name; document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+reviewDl.addEventListener("click", () => {
+  if (!reviewPly) return;
+  const { master, newView, scaled } = reviewPly;
+  saveBuffer(master, "master_before_merge.ply");
+  setTimeout(() => saveBuffer(newView, scaled ? "new_view_metric.ply" : "new_view_relative.ply"), 400);
+  setStatus("Downloading master_before_merge.ply and " + (scaled ? "new_view_metric.ply" : "new_view_relative.ply") +
+    ". If only one arrives, allow multiple downloads for this site. The new view is in its own camera frame, not yet moved onto the master.");
+});
 async function enterReview(alignMsg = "") {
   if (!ghost || !ghost.vd) return;
   setState("review"); setStatus("Building the two point clouds…"); await tick();
@@ -580,6 +597,7 @@ async function enterReview(alignMsg = "") {
   const { w, h } = ghost.vd, synth = renderSynthetic(ghost.master, ghost.pose, w, h);
   const fit = fitDepthToMaster(ghost.vd.disp, synth.depth, w, h);
   const scaled = fit.ok, newPly = buildPLY(ghost.vd.img, ghost.vd.disp, scaled ? { a: fit.a, b: fit.b } : null);
+  reviewPly = { master: lastPly, newView: newPly, scaled };
   const nMaster = revTop.load(lastPly, { units: "m" }), nNew = revBot.load(newPly, { units: scaled ? "m" : "units" });
   revTopTag.textContent = `Master · ${nMaster.toLocaleString()} points · metres`;
   revBotTag.textContent = `New view · ${nNew.toLocaleString()} points · ` + (scaled ? "metres (fitted to master)" : "relative depth");
