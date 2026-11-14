@@ -152,6 +152,11 @@
   .panel canvas { width:100%; height:100%; display:block; }
   #app[data-state=review] #dock .btn.primary { flex:2; }
 
+  /* review heat map: legend over the lower panel */
+  #heatLegend { position:absolute; left:12px; right:12px; bottom:10px; display:flex; align-items:center; gap:8px; font:11px ui-monospace, Menlo, Consolas, monospace; pointer-events:none; }
+  #heatLegend i { flex:1; height:8px; border-radius:4px; background:linear-gradient(90deg,rgb(0,0,255),rgb(0,255,255),rgb(0,255,0),rgb(255,255,0),rgb(255,0,0)); }
+  #heatLegend span { padding:1px 6px; background:rgba(0,0,0,.65); border-radius:8px; }
+  #reviewHeat.on { border-color:var(--gold); color:var(--gold); }
   #loupe { position:absolute; top:10px; right:10px; width:180px; height:180px; border:2px solid #fff;
            border-radius:10px; background:#000; pointer-events:none; z-index:3; }
   #zoomTag { position:absolute; left:12px; bottom:20px; padding:2px 8px; font:12px ui-monospace, Menlo, Consolas, monospace;
@@ -214,6 +219,7 @@
       <section class="panel">
         <canvas id="revBotCv"></canvas>
         <span class="tag" id="revBotTag">New view</span>
+        <div id="heatLegend" hidden><span>0</span><i></i><span id="heatMax">20 mm</span></div>
       </section>
     </div>
 
@@ -241,6 +247,11 @@
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
           Add view
         </button>
+        <button id="mergeFile" class="tb" title="Register and merge another .ply into this cloud" aria-label="Merge a .ply file">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4v5a4 4 0 0 0 4 4h4a4 4 0 0 1 4 4v3M18 4v5a4 4 0 0 1-4 4"/><path d="M15 20l3 3 3-3" transform="translate(-3 -3)"/></svg>
+          Merge file
+        </button>
+        <input id="fileIn" type="file" accept=".ply" hidden>
         <button id="selUndo" class="tb" title="Undo delete" aria-label="Undo delete" disabled>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg>
         </button>
@@ -303,6 +314,9 @@
     <button id="reviewAdjust" class="btn ghost" data-states="review" hidden>Adjust</button>
     <button id="reviewDownload" class="btn ghost" data-states="review" style="flex:none;width:48px;padding:0" title="Download both point clouds (.ply)" aria-label="Download both point clouds" hidden>
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 20h16"/></svg>
+    </button>
+    <button id="reviewHeat" class="btn ghost" data-states="review" style="flex:none;width:48px;padding:0" title="Show how far the new view sits from the master (heat map)" aria-label="Toggle gap heat map" aria-pressed="false" hidden>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3c3 4 6 6 6 10a6 6 0 0 1-12 0c0-4 3-6 6-10z"/></svg>
     </button>
     <button id="reviewMerge" class="btn primary" data-states="review" hidden>
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12l5 5 9-10"/></svg>

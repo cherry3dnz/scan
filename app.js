@@ -1,6 +1,7 @@
 import { SplatViewer } from "./splat.js";
 import { loadModel, estimateDepth, buildPLY, fitMetric, filterPLY, intrinsics } from "./pipeline.js";
 import { parsePLY } from "./splat.js";
+import { registerAndMerge, compareForReview } from "./cloudops.js";
 import { poseFromViewer, poseFromLookAt, renderSynthetic, drawGhost, registerView, workingSize, nudgePose, medianDepth, subsampleMaster, autoAlign, fitDepthToMaster } from "./register.js";
 
 const $ = (id) => document.getElementById(id);
@@ -16,6 +17,7 @@ const ghostCv = $("ghost"), addViewBtn = $("addView"), ghostCancel = $("ghostCan
 const alignRetake = $("alignRetake"), alignAuto = $("alignAuto"), alignMerge = $("alignMerge"), alignReview = $("alignReview");
 const reviewAdjust = $("reviewAdjust"), reviewRetake = $("reviewRetake"), reviewMerge = $("reviewMerge");
 const revTopTag = $("revTopTag"), revBotTag = $("revBotTag");
+const reviewHeat = $("reviewHeat"), heatLegend = $("heatLegend"), heatMax = $("heatMax"), mergeFile = $("mergeFile"), fileIn = $("fileIn");
 let revTop = null, revBot = null;   // two extra splat viewers for the capture review (created on first use)
 const selClear = $("selClear"), selDelete = $("selDelete"), selDelLabel = $("selDelLabel"), selUndo = $("selUndo"), vhint = $("vhint");
 const presets = (window.APP_CONFIG && window.APP_CONFIG.REFERENCE_PRESETS) || [];
@@ -558,10 +560,12 @@ function leaveGhost(msg) {
 }
 const tick = () => new Promise((r) => setTimeout(r, 30));      // let the status text paint before a heavy loop
 const reviewDl = $("reviewDownload");
+let heatOn = false;                                            // review: bottom panel shows the gap heat map instead of the raw new view
 let reviewPly = null;                                          // { master, newView, scaled } buffers behind the two review panels
 function setAlignBusy(on) {
   alignRetake.disabled = alignAuto.disabled = alignMerge.disabled = alignReview.disabled = on;
   reviewAdjust.disabled = reviewRetake.disabled = reviewMerge.disabled = reviewDl.disabled = on;
+  reviewHeat.disabled = on || !(reviewPly && reviewPly.overlay);
 }
 
 // ---------- capture review: master (top) and the new view's point cloud (bottom) ----------
@@ -573,7 +577,7 @@ function ensureReviewViewers() {
   revBot = new SplatViewer($("revBotCv"), { spinSpeed: 0 });
 }
 function clearReview() {
-  reviewPly = null;
+  reviewPly = null; heatOn = false; heatLegend.hidden = true; reviewHeat.classList.remove("on"); reviewHeat.setAttribute("aria-pressed", "false");
   for (const v of [revTop, revBot]) if (v && v.count) v._setData(new Float32Array(0), 0);   // stop drawing while hidden
 }
 // Saves both review clouds as separate .ply files (staggered, because browsers may block simultaneous downloads).
@@ -597,14 +601,55 @@ async function enterReview(alignMsg = "") {
   const { w, h } = ghost.vd, synth = renderSynthetic(ghost.master, ghost.pose, w, h);
   const fit = fitDepthToMaster(ghost.vd.disp, synth.depth, w, h);
   const scaled = fit.ok, newPly = buildPLY(ghost.vd.img, ghost.vd.disp, scaled ? { a: fit.a, b: fit.b } : null);
-  reviewPly = { master: lastPly, newView: newPly, scaled };
+  reviewPly = { master: lastPly, newView: newPly, scaled, overlay: null };
   const nMaster = revTop.load(lastPly, { units: "m" }), nNew = revBot.load(newPly, { units: scaled ? "m" : "units" });
   revTopTag.textContent = `Master · ${nMaster.toLocaleString()} points · metres`;
   revBotTag.textContent = `New view · ${nNew.toLocaleString()} points · ` + (scaled ? "metres (fitted to master)" : "relative depth");
   const q = scaled ? `Depth fit: ${(fit.inlierFrac * 100).toFixed(0)}% of overlap agrees, ${(fit.relErr * 100).toFixed(1)}% median error. `
     : `Depth could not be fitted to the master (${fit.reason}). `;
-  setStatus(q + "Orbit each panel to check the shapes match, then press Merge two point clouds. " + alignMsg);
+  // Heat map: the new view placed at the current alignment and coloured by its distance to the master surface (cloudops.js).
+  let gap = "";
+  if (scaled) {
+    try {
+      const tol = (window.APP_CONFIG && window.APP_CONFIG.REVIEW_TOL) || 0.02, c = compareForReview(lastPly, newPly, ghost.pose, { tol });
+      reviewPly.overlay = c.overlay; reviewPly.tol = tol; heatMax.textContent = Math.round(tol * 1000) + " mm";
+      gap = `At this alignment the new view is a median ${(c.stats.median * 1000).toFixed(0)} mm from the master, ${Math.round(c.stats.within[tol] * 100)}% within ${Math.round(tol * 1000)} mm (heat map button). `;
+    } catch (e) { console.warn("heat map skipped", e); }
+  }
+  reviewHeat.disabled = !reviewPly.overlay;
+  setStatus(q + gap + "Orbit each panel to check the shapes match, then press Merge two point clouds. " + alignMsg);
 }
+reviewHeat.addEventListener("click", () => {
+  if (!reviewPly || !reviewPly.overlay) return;
+  heatOn = !heatOn;
+  reviewHeat.classList.toggle("on", heatOn); reviewHeat.setAttribute("aria-pressed", String(heatOn)); heatLegend.hidden = !heatOn;
+  if (heatOn) { revBot.load(reviewPly.overlay, { units: "m" }); revBotTag.textContent = "New view on the master · colour = gap (blue 0 → red " + heatMax.textContent + ", grey = no master nearby)"; }
+  else { const n = revBot.load(reviewPly.newView, { units: reviewPly.scaled ? "m" : "units" }); revBotTag.textContent = `New view · ${n.toLocaleString()} points · ` + (reviewPly.scaled ? "metres (fitted to master)" : "relative depth"); }
+});
+
+// ---------- merge another .ply file into the master (cloud-to-cloud register + merge, cloudops.js) ----------
+mergeFile.addEventListener("click", () => { if (lastPly && !busy) fileIn.click(); });
+fileIn.addEventListener("change", async () => {
+  const f = fileIn.files[0]; fileIn.value = "";
+  if (!f || !lastPly || busy) return;
+  busy = true; mergeFile.disabled = true;
+  try {
+    setStatus("Reading " + f.name + "…"); await tick();
+    const buf = await f.arrayBuffer();
+    setStatus("Aligning " + f.name + " to the master…"); await tick();
+    const r = registerAndMerge(lastPly, buf, { ...((window.APP_CONFIG && window.APP_CONFIG.IMPORT) || {}) });
+    if (!r.ok) { setStatus("Not merged: " + r.reason + ". If the two clouds barely overlap, capture the second one with Add view instead."); return; }
+    undoStack.push(lastPly); if (undoStack.length > 10) undoStack.shift();
+    lastPly = r.merged; merges++;
+    viewer.load(lastPly, { units: "m", keepView: true }); updateTrim();
+    setStatus(`Merged ${f.name}: +${r.added.toLocaleString()} new points (${r.covered.toLocaleString()} already covered, ${r.outliers.toLocaleString()} stray points dropped). ` +
+      `Median gap ${(r.before.median * 1000).toFixed(0)} → ${(r.after.median * 1000).toFixed(0)} mm, residual ${(r.reg.rmse * 1000).toFixed(1)} mm. Undo reverts it.`);
+  } catch (e) {
+    console.error(e); setStatus("Error: " + e.message);
+  } finally {
+    busy = false; mergeFile.disabled = false;
+  }
+});
 
 addViewBtn.addEventListener("click", () => {
   if (!lastPly || busy) return;

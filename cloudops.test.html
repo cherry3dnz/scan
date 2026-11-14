@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cloudops tests</title>
+<style>
+  body { margin:0; padding:12px; background:#111; color:#ddd; font:12px/1.45 ui-monospace,Menlo,Consolas,monospace; }
+  #sum { position:sticky; top:0; padding:8px 10px; margin:-12px -12px 8px; background:#222; font-size:14px; }
+  .pass { color:#6c6; } .fail { color:#f66; font-weight:bold; } .info { color:#fc6; } pre { margin:0; white-space:pre-wrap; }
+</style>
+<div id="sum">Running… the page may freeze for ~20 s (the tests run on the main thread)</div>
+<div id="out"></div>
+<script type="module">
+  const out = document.getElementById("out"), sum = document.getElementById("sum");
+  let pass = 0, fail = 0;
+  console.log = (...a) => {                                  // mirror every test line onto the page
+    const s = a.join(" "), p = document.createElement("pre");
+    p.className = /^\s*PASS/.test(s) ? "pass" : /^\s*FAIL/.test(s) ? "fail" : /INFO|skipped/.test(s) ? "info" : "";
+    if (p.className === "pass") pass++; if (p.className === "fail") fail++;
+    p.textContent = s; out.appendChild(p);
+  };
+  await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 50)));   // let "Running..." paint first
+  try { await import("./cloudops.test.mjs"); } catch (e) { console.log("FAIL test run crashed: " + e.message); }
+  sum.textContent = fail ? `${fail} FAILED, ${pass} passed` : `All ${pass} checks passed`;
+  sum.style.color = fail ? "#f66" : "#6c6";
+</script>

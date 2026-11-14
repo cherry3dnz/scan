@@ -4,6 +4,7 @@
 // A pose is camera-to-world: { R: [9 numbers, row-major], t: [x, y, z] }  =>  p_master = R * p_cam + t
 import { intrinsics, normParams, resizeBilinear } from "./pipeline.js";
 import { parsePLY } from "./splat.js";
+import { icpPlane, icpDepth } from "./cloudops.js";
 
 const CFG = globalThis.APP_CONFIG || {};
 const MAX_SIDE = CFG.MAX_SIDE || 640;
@@ -26,6 +27,7 @@ export const DEFAULTS = {
   tolAbs: 0.015, tolRel: 0.02,           // "same surface" tolerance in the depth test (m, fraction)
   // coarse-to-fine ICP. Capture radius of the first stage is cell (m): keep the guess pose within about that.
   stages: [{ cell: 0.12, iters: 10 }, { cell: 0.04, iters: 10 }, { cell: 0.015, iters: 10 }],
+  icpMethod: "depth",                     // "depth" = pose and depth scale solved together (cloudops.icpDepth), "plane" = point-to-plane ICP, "point" = the original grid ICP
 };
 
 // ---------- small matrix helpers (3x3 row-major) ----------
@@ -413,7 +415,14 @@ export function registerView(masterBuf, view, pose0, opts = {}) {
       }
       if (cov) ov.push(np.pos[i * 3], np.pos[i * 3 + 1], np.pos[i * 3 + 2]);
     }
-    ic = icp(master, transformPoints(Float32Array.from(ov), pose), o.stages);
+    if (o.icpMethod === "depth") {                                  // joint pose + depth-fit solve: updates both
+      const d = icpDepth(master, Float32Array.from(ov), fit, pose, { stages: o.stages });
+      if (!d.ok) return fail(d.reason);
+      pose = d.pose; fit = { ...fit, a: d.a, b: d.b }; ic = { ok: true, rmse: d.rmse, frac: d.frac };
+      continue;
+    }
+    const src = transformPoints(Float32Array.from(ov), pose);
+    ic = o.icpMethod === "point" ? icp(master, src, o.stages) : icpPlane(master, src, o.stages);
     if (!ic.ok) return fail(ic.reason);
     pose = composePose(ic, pose);
   }
